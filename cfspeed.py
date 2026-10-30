@@ -45,21 +45,31 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.2"
+VERSION = "1.3"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
+
+# Cloudflare 支持 HTTPS 的端口(全套)
+ALL_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
+DEFAULT_PORTS = [443]
+
+# 本地配置(记录上次填的 Worker 域名,不进入版本库)
+CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "cfspeed.cfg")
 
 try:
     import presets as P
 except Exception:
     P = None
 
-# 内置预设: 名称 -> (说明, 数据)
+# 内置预设: 名称 -> (说明, 数据, 是否抽样扫描)
 PRESETS = {}
-if P is not None and getattr(P, "DOMAINS", None):
-    PRESETS = {
-        "domains": (f"优选域名 ({len(P.DOMAINS)} 个)", P.DOMAINS),
-    }
+if P is not None:
+    if getattr(P, "DOMAINS", None):
+        PRESETS["domains"] = (f"优选域名 ({len(P.DOMAINS)} 个)", P.DOMAINS, False)
+    if getattr(P, "IPS", None):
+        PRESETS["ips"] = (f"指定 IP ({len(P.IPS)} 个)", P.IPS, False)
+    if getattr(P, "CIDRS", None):
+        PRESETS["cidrs"] = (f"Cloudflare 网段 ({len(P.CIDRS)} 个,抽样扫描,较慢)", P.CIDRS, True)
 
 # ---------- Cloudflare 官方 IPv4 网段(用于判断域名是否真的走 CF) ----------
 CF_NETS = [ipaddress.ip_network(n) for n in [
@@ -308,13 +318,29 @@ def expand_cidr(spec, per_net=24):
     return out
 
 
-def build_targets(items):
+def sample_net(net, k):
+    """从网段里随机取 k 个 IP"""
+    size = net.num_addresses
+    if size <= 2:
+        return []
+    k = min(k, size - 2)
+    base = int(net.network_address)
+    return [str(ipaddress.IPv4Address(base + o))
+            for o in random.sample(range(1, size - 1), k)]
+
+
+def build_targets(items, sample_cidr=False, per_net=1, cap=1200):
     """
     统一解析目标,返回 [(host, port 或 None), ...]
     支持: IP、域名、IP:端口、域名:端口、网段(CIDR)
+    sample_cidr=True 时每个网段只随机抽 per_net 个 IP,总量不超过 cap
     """
     out, seen = [], set()
-    for raw in items:
+    src = list(items)
+    if sample_cidr:
+        random.shuffle(src)          # 打乱后取,保证各网段覆盖均匀
+
+    for raw in src:
         s = str(raw).strip()
         if not s or s.startswith("#"):
             continue
@@ -322,14 +348,18 @@ def build_targets(items):
         # 网段
         if "/" in s:
             try:
-                ipaddress.ip_network(s, strict=False)
-                for ip in expand_cidr(s):
+                net = ipaddress.ip_network(s, strict=False)
+            except ValueError:
+                net = None
+            if net is not None:
+                ips = sample_net(net, per_net) if sample_cidr else expand_cidr(s)
+                for ip in ips:
                     if (ip, None) not in seen:
                         seen.add((ip, None))
                         out.append((ip, None))
+                if sample_cidr and len(out) >= cap:
+                    break
                 continue
-            except ValueError:
-                pass
 
         if "://" in s:
             s = s.split("://", 1)[1]
@@ -518,12 +548,111 @@ def run(targets, worker, rounds, do_speed, ports, threads):
     except Exception as e:
         print(yellow(f"\n保存失败: {e}"))
 
+    out_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir)
+
     print(gray(f"总耗时 {time.time()-t_start:.0f}s"))
+    return 0
+    return 0
+
+
+def _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
+    """同时写一份人类可读的 txt 报告"""
+    txt = os.path.join(out_dir, f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    lines = []
+    lines.append("=" * 70)
+    lines.append("  CF 优选测速结果")
+    lines.append("=" * 70)
+    lines.append(f"Worker:   {worker}")
+    lines.append(f"目标:     {len(rows)} 个")
+    lines.append(f"端口:     {','.join(map(str, ports))}")
+    lines.append(f"采样轮数: {rounds}")
+    lines.append(f"带宽测试: {'是' if do_speed else '否'}")
+    lines.append("")
+
+    if good:
+        lines.append("-" * 70)
+        lines.append(f"{'#':>3} {'目标':24} {'IP':17} {'机房':6} {'端口':>5} {'中位ms':>7} {'最快ms':>7} {'抖动ms':>7} {'带宽Mbps':>9}")
+        lines.append("-" * 70)
+        for i, r in enumerate(good, 1):
+            mb = f'{r["mbps"]:.1f}' if r["mbps"] else "-"
+            lines.append(
+                f"{i:>3} {r['target'][:24]:24} {r['ip']:17} {r['colo'] or '-':6} "
+                f"{r['port']:>5} {r['med']:>7.0f} {r['min']:>7.0f} {r['sd']:>7.0f} {mb:>9}"
+            )
+        lines.append("")
+
+        colos = {}
+        for r in good:
+            colos[r["colo"]] = colos.get(r["colo"], 0) + 1
+        lines.append("机房分布: " + "  ".join(f"{k} {v}个" for k, v in
+                                            sorted(colos.items(), key=lambda x: -x[1])))
+        best = good[0]
+        lines.append(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  中位 {best['med']:.0f}ms")
+        lines.append("")
+
+    if bad:
+        lines.append(f"不可用 {len(bad)} 个:")
+        for r in bad[:20]:
+            lines.append(f"   {r['target']} ({r['ip']}:{r['port']})  —  {r['note']}")
+        lines.append("")
+
+    lines.append(f"总耗时 {time.time()-t_start:.0f}s")
+    lines.append("=" * 70)
+
+    try:
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(gray(f"文本报告: {txt}"))
+    except Exception as e:
+        print(yellow(f"文本报告保存失败: {e}"))
+    return txt
     return 0
 
 
 def split_text(text):
     return [x for x in text.replace(",", "\n").replace(";", "\n").split("\n") if x.strip()]
+
+
+def load_cfg():
+    try:
+        with open(CFG_PATH, encoding="utf-8") as f:
+            d = {}
+            for line in f:
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    d[k.strip()] = v.strip()
+            return d
+    except Exception:
+        return {}
+
+
+def save_cfg(d):
+    try:
+        with open(CFG_PATH, "w", encoding="utf-8") as f:
+            for k, v in d.items():
+                f.write(f"{k}={v}\n")
+    except Exception:
+        pass
+
+
+def parse_ports(text):
+    t = (text or "").strip().lower()
+    if not t:
+        return list(DEFAULT_PORTS)
+    if t in ("all", "全部", "*", "a"):
+        return list(ALL_PORTS)
+    out = []
+    for x in t.replace(",", " ").replace("，", " ").split():
+        if x.isdigit() and int(x) not in out:
+            out.append(int(x))
+    return out or list(DEFAULT_PORTS)
+
+
+def expand_preset(name):
+    label, data, sample = PRESETS[name]
+    print(gray(f"已选: {label}"))
+    return build_targets(data, sample_cidr=sample)
 
 
 def choose_preset():
@@ -532,13 +661,11 @@ def choose_preset():
     print("内置预设:")
     for i, k in enumerate(keys, 1):
         print(f"  [{i}] {PRESETS[k][0]}")
-    sel = input("选择: ").strip()
+    sel = input(f"选择 [1]: ").strip() or "1"
     if not sel.isdigit() or not (1 <= int(sel) <= len(keys)):
         print(red("无效选择。"))
         return []
-    name = keys[int(sel) - 1]
-    print(gray(f"已选: {PRESETS[name][0]}"))
-    return build_targets(PRESETS[name][1])
+    return expand_preset(keys[int(sel) - 1])
 
 
 def interactive():
@@ -549,27 +676,35 @@ def interactive():
     print(gray("测 IP / 域名在你当前网络下的真实质量"))
     print()
 
-    worker = ""
-    while not worker:
-        worker = input("Worker 域名(SNI/Host,必填): ").strip()
-        if not worker:
-            print(red("  必须填写你自己的 Worker 域名，例如 abc.workers.dev"))
+    cfg = load_cfg()
+    saved = cfg.get("worker", "").strip()
+    if saved:
+        worker = input(f"Worker 域名(SNI/Host)[{saved}]: ").strip() or saved
+    else:
+        worker = ""
+        while not worker:
+            worker = input("Worker 域名(SNI/Host,必填,如 xxx.cfpages.dev): ").strip()
+            if not worker:
+                print(red("  必须填写你自己的 Worker 域名,例如 xxx.cfpages.dev"))
+    if worker != saved:
+        save_cfg({"worker": worker})
+        print(gray(f"  已记住,下次直接回车即可(保存在 {os.path.basename(CFG_PATH)})"))
 
     print()
     print("输入方式:")
-    print("  [1] 直接粘贴 IP 或域名(多行,空行结束)")
-    print("  [2] 从文件读取")
-    print("  [3] 扫描网段(如 162.159.38.0/24)")
     if PRESETS:
-        print("  [4] 使用内置预设")
+        print("  [1] 使用内置预设")
+    print("  [2] 直接粘贴 IP 或域名(多行,空行结束)")
+    print("  [3] 从文件读取")
+    print("  [4] 扫描网段(如 162.159.38.0/24)")
     mode = input("选择 [1]: ").strip() or "1"
 
     targets = []
-    if mode == "4" and PRESETS:
+    if mode == "1" and PRESETS:
         targets = choose_preset()
         if not targets:
             return 1
-    elif mode == "2":
+    elif mode == "3":
         path = input("文件路径: ").strip().strip('"')
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
@@ -577,7 +712,7 @@ def interactive():
         except Exception as e:
             print(red(f"读取失败: {e}"))
             return 1
-    elif mode == "3":
+    elif mode == "4":
         spec = input("网段: ").strip()
         try:
             targets = build_targets([spec])
@@ -602,21 +737,16 @@ def interactive():
         return 1
 
     try:
-        rounds = int(input("采样轮数 [5]: ").strip() or "5")
+        rounds = int(input("采样轮数 [1]: ").strip() or "1")
     except ValueError:
-        rounds = 5
+        rounds = 1
     rounds = max(1, min(rounds, 30))
 
     ans = input("是否测下载带宽?(较慢,建议只在选出候选后测)[y/N]: ").strip().lower()
     do_speed = ans in ("y", "yes", "是")
 
-    ptxt = input("端口 [443]: ").strip() or "443"
-    try:
-        ports = [int(x) for x in ptxt.replace(",", " ").split() if x.isdigit()]
-    except Exception:
-        ports = [443]
-    if not ports:
-        ports = [443]
+    print(gray("可选端口: " + " ".join(str(p) for p in ALL_PORTS) + "(输入 all 用全部)"))
+    ports = parse_ports(input("端口 [443]: "))
 
     return run(targets, worker, rounds, do_speed, ports, 60)
 
@@ -633,9 +763,11 @@ def main():
                     help="使用内置预设: " + " / ".join(PRESETS) if PRESETS else "无预设")
     ap.add_argument("-w", "--worker", default=os.environ.get("CF_WORKER", ""),
                     help="Worker 域名(SNI/Host),必填,也可用环境变量 CF_WORKER")
-    ap.add_argument("-r", "--rounds", type=int, default=5, help="采样轮数")
+    ap.add_argument("-r", "--rounds", type=int, default=1, help="采样轮数,默认 1")
     ap.add_argument("-s", "--speed", action="store_true", help="测下载带宽")
-    ap.add_argument("-p", "--ports", default="443", help="端口,如 443,2096")
+    ap.add_argument("-p", "--ports", default="443",
+                    help="端口,默认 443;输入 all 表示全部 6 个: "
+                         + " ".join(str(p) for p in ALL_PORTS))
     ap.add_argument("-n", "--threads", type=int, default=60, help="并发数")
     ap.add_argument("-v", "--version", action="version", version=f"cfspeed {VERSION}")
     args = ap.parse_args()
@@ -680,4 +812,15 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except Exception as e:
+        print(red(f"程序异常: {e}"))
+        rc = 1
+    # Windows 双击运行时窗口会立即关闭,加暂停让用户看到结果
+    if os.name == "nt" and len(sys.argv) == 1:
+        try:
+            input("\n按回车键退出...")
+        except (KeyboardInterrupt, EOFError):
+            pass
+    sys.exit(rc)
