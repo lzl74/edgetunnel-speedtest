@@ -29,7 +29,7 @@ CF 优选测速器 (cfspeed)
     -w, --worker    Worker 域名(SNI 与 Host),必填
     -r, --rounds    采样轮数,默认 1
     -s, --speed     额外测下载带宽(交互模式会在测速后询问)
-    -p, --ports     端口池,默认 443;输入 all/random 时每个目标随机用 1 个端口
+    -p, --ports     端口池,默认 all=每个目标随机 1 个端口
     -n, --threads   并发数,默认 60
 
 交互模式流程:
@@ -55,9 +55,8 @@ VERSION = "1.4"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
-# Cloudflare 支持 HTTPS 的端口(全套)
+# Cloudflare 支持 HTTPS 的端口(全套);默认从中随机,每个目标 1 个
 ALL_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
-DEFAULT_PORTS = [443]
 
 # 本地配置(记录上次填的 Worker 域名,不进入版本库)
 CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "cfspeed.cfg")
@@ -669,16 +668,14 @@ def save_cfg(d):
 
 def parse_ports(text):
     t = (text or "").strip().lower()
-    if not t:
-        return list(DEFAULT_PORTS)
-    if t in ("all", "全部", "*", "a", "random", "rand", "r", "随机"):
-        # 返回全部可用端口池;每个目标在 run() 里单独随机抽 1 个
+    if not t or t in ("all", "全部", "*", "a", "random", "rand", "r", "随机"):
+        # 默认即随机:返回全部端口池,每个目标在 run() 里单独随机抽 1 个
         return list(ALL_PORTS)
     out = []
     for x in t.replace(",", " ").replace("，", " ").split():
         if x.isdigit() and int(x) not in out:
             out.append(int(x))
-    return out or list(DEFAULT_PORTS)
+    return out or list(ALL_PORTS)
 
 
 def expand_preset(name):
@@ -701,6 +698,19 @@ def choose_preset():
 
 
 def interactive():
+    try:
+        return _interactive()
+    except KeyboardInterrupt:
+        print(yellow("\n已取消。"))
+        return 130
+    except Exception:
+        import traceback
+        print(red("\n程序出错,详细信息:"))
+        traceback.print_exc()
+        return 1
+
+
+def _interactive():
     print()
     print(bold("=" * 56))
     print(bold("  CF 优选测速器  v" + VERSION))
@@ -774,8 +784,8 @@ def interactive():
         rounds = 1
     rounds = max(1, min(rounds, 30))
 
-    print(gray("可选端口池: " + " ".join(str(p) for p in ALL_PORTS) + " (每个目标随机1个,回车=443)"))
-    ports = parse_ports(input("端口 [443]: "))
+    print(gray("端口池: " + " ".join(str(p) for p in ALL_PORTS) + " (默认随机:每个目标随机1个;可指定,如 443,2053)"))
+    ports = parse_ports(input("端口 [随机]: "))
 
     out_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     result = run(targets, worker, rounds, ports, 60)
@@ -812,8 +822,8 @@ def main():
                     help="Worker 域名(SNI/Host),必填,也可用环境变量 CF_WORKER")
     ap.add_argument("-r", "--rounds", type=int, default=1, help="采样轮数,默认 1")
     ap.add_argument("-s", "--speed", action="store_true", help="测下载带宽")
-    ap.add_argument("-p", "--ports", default="443",
-                    help="端口,默认 443;输入 random 随机抽 3 个: "
+    ap.add_argument("-p", "--ports", default="all",
+                    help="端口池,默认 all=每个目标随机 1 个: "
                          + " ".join(str(p) for p in ALL_PORTS))
     ap.add_argument("-n", "--threads", type=int, default=60, help="并发数")
     ap.add_argument("-v", "--version", action="version", version=f"cfspeed {VERSION}")

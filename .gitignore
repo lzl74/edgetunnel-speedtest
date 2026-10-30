@@ -11,7 +11,9 @@ dist/
 *.spec
 
 # 运行产物
+cfspeed.cfg
 cfspeed_*.csv
+cfspeed_*.txt
 result*.csv
 result*.json
 bulk_result*.json
