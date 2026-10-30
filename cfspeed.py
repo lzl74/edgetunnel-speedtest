@@ -409,6 +409,7 @@ def run(targets, worker, rounds, ports, threads):
     items = []          # (显示名, ip, 端口)
     rejected = []
     n_total = len(targets)
+    print(gray(f"阶段 0/3  解析目标(共 {n_total} 个,域名需 DNS 查询,可能较慢) ..."))
     for idx, entry in enumerate(targets, 1):
         t, tport = entry if isinstance(entry, tuple) else (entry, None)
         progress(f"解析 {idx}/{n_total}  {t}")
@@ -703,6 +704,9 @@ def interactive():
     except KeyboardInterrupt:
         print(yellow("\n已取消。"))
         return 130
+    except EOFError:
+        print(red("\n输入被中断(EOF)。"))
+        return 1
     except Exception:
         import traceback
         print(red("\n程序出错,详细信息:"))
@@ -884,8 +888,15 @@ if __name__ == "__main__":
         rc = 1
     # Windows 双击运行时窗口会立即关闭,加暂停让用户看到结果
     if os.name == "nt" and len(sys.argv) == 1:
-        try:
-            input("\n按回车键退出...")
-        except (KeyboardInterrupt, EOFError):
-            pass
+        if rc == 0:
+            input("\n全部完成,按回车键退出...")
+        else:
+            print(red("\n" + "!" * 56))
+            print(red("  程序没有正常完成,原因见上方红色/灰色文字"))
+            print(red("  (常见原因: 目标全部不可用 / 全部连不上 / 输入被中断)"))
+            print(red("!" * 56))
+            try:
+                input("按回车键退出...")
+            except (KeyboardInterrupt, EOFError):
+                pass
     sys.exit(rc)
