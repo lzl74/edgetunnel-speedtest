@@ -1,8 +1,8 @@
 # edgetunnel-speedtest
 
-> 测 Cloudflare 优选 IP / 优选域名的**真实可用性**，而不是 ping。
+> 专门给 [edgetunnel](https://github.com/cmliu/edgetunnel) 用的优选测速器 —— 测 Cloudflare 优选 IP / 优选域名的**真实可用性**，而不是 ping。
 
-为 [edgetunnel](https://github.com/cmliu/edgetunnel) 这类基于 Cloudflare Worker 的部署而写：帮你在自己的网络环境下，从一堆"优选"地址里找出真正能用的那几个。
+配合 edgetunnel（基于 Cloudflare Worker 的 VLESS 部署）使用：帮你在自己的网络环境下，从一堆"优选"地址里找出真正能用的那几个，直接输出可复制的 `域名/IP:端口`。
 
 ```
   # 目标                    IP                 机房  端口    中位    最快   抖动     带宽
