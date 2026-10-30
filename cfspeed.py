@@ -12,13 +12,14 @@ CF 优选测速器 (cfspeed)
 用法:
     双击运行(交互式)     直接跑,按提示输入
     命令行:
-        cfspeed.py --preset ips -w 你的域名
+        cfspeed.py --preset domains -w 你的域名
         cfspeed.py -t 1.2.3.4,example.com -w 你的域名.workers.dev
         cfspeed.py -f list.txt -r 8 -s
         cfspeed.py -c 162.159.38.0/24 -w 你的域名
 
 内置预设(--preset):
-    domains  优选域名列表
+    domains  优选域名列表(426 个)
+    cidrs    Cloudflare 网段池(抽样扫描)
 
 参数:
     -t, --targets   IP / 域名列表,逗号或空格分隔
@@ -26,10 +27,15 @@ CF 优选测速器 (cfspeed)
     -c, --cidr      扫描网段,如 162.159.38.0/24
     --preset        使用内置预设
     -w, --worker    Worker 域名(SNI 与 Host),必填
-    -r, --rounds    采样轮数,默认 5
-    -s, --speed     额外测下载带宽(耗时较长)
-    -p, --ports     端口列表,默认 443
+    -r, --rounds    采样轮数,默认 1
+    -s, --speed     额外测下载带宽(交互模式会在测速后询问)
+    -p, --ports     端口池,默认 443;输入 all/random 时每个目标随机用 1 个端口
     -n, --threads   并发数,默认 60
+
+交互模式流程:
+    输入目标 → 测延迟/机房 → 出结果(可直接复制的 域名:端口 列表)
+    → 询问是否测下载带宽 → 输入测前几名 → 输出带帽数值的最终结果
+    结果同时保存 CSV 和 TXT 报告
 """
 import argparse
 import csv
@@ -45,7 +51,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.3"
+VERSION = "1.4"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
@@ -378,20 +384,35 @@ def build_targets(items, sample_cidr=False, per_net=1, cap=1200):
     return out
 
 
+# ---------- 带宽测试 ----------
+def run_speed_batch(good, topn):
+    """串行测前 topn 名的下载带宽,直接修改 good 列表中的 mbps 字段"""
+    if not good or topn <= 0:
+        return
+    topn = min(topn, len(good))
+    print(gray(f"阶段 3/3  下载带宽,串行测前 {topn} 名 ..."))
+    for i, r in enumerate(good[:topn], 1):
+        r["mbps"] = speed_test(r["ip"], r["port"])
+        progress(f"{i}/{topn}  {r['ip']}:{r['port']}  "
+                 f"{(str(r['mbps'])+' Mbps') if r['mbps'] else '失败'}")
+    clear_progress(60)
+
+
 # ---------- 主流程 ----------
-def run(targets, worker, rounds, do_speed, ports, threads):
+def run(targets, worker, rounds, ports, threads):
     t_start = time.time()
     print()
     print(bold(f"Worker 域名 (SNI/Host): {worker}"))
-    print(bold(f"目标 {len(targets)} 个 | 采样 {rounds} 轮 | 端口 {','.join(map(str, ports))}"
-               + (" | 含带宽测试" if do_speed else "")))
+    print(bold(f"目标 {len(targets)} 个 | 采样 {rounds} 轮 | 端口池 {','.join(map(str, ports))}(每个目标随机1个)"))
     print()
 
     # 1. 解析
     items = []          # (显示名, ip, 端口)
     rejected = []
-    for entry in targets:
+    n_total = len(targets)
+    for idx, entry in enumerate(targets, 1):
         t, tport = entry if isinstance(entry, tuple) else (entry, None)
+        progress(f"解析 {idx}/{n_total}  {t}")
         ips = resolve(t)
         if not ips:
             rejected.append((t, "DNS 解析失败"))
@@ -400,10 +421,11 @@ def run(targets, worker, rounds, do_speed, ports, threads):
         if not good:
             rejected.append((t, f"非 Cloudflare IP ({ips[0]})"))
             continue
-        plist = [tport] if tport else ports
+        plist = [tport] if tport else [random.choice(ports)]
         for ip in good[:2]:
             for p in plist:
                 items.append((t, ip, p))
+    clear_progress()
 
     if rejected:
         print(gray(f"淘汰 {len(rejected)} 个目标:"))
@@ -415,44 +437,51 @@ def run(targets, worker, rounds, do_speed, ports, threads):
 
     if not items:
         print(red("没有可测试的目标。"))
-        return 1
+        return None
 
     # 2. TCP 快筛
-    print(gray("阶段 1/3  TCP 连通性 ..."))
+    print(gray(f"阶段 1/3  TCP 连通性 ({len(items)} 个) ..."))
     alive = []
+    tcp_done = 0
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futs = {ex.submit(tcp_probe, ip, p): (t, ip, p) for t, ip, p in items}
         for fu in as_completed(futs):
             r = fu.result()
+            tcp_done += 1
+            progress(f"TCP {tcp_done}/{len(items)}")
             if r is not None:
                 alive.append(futs[fu])
+    clear_progress()
     print(gray(f"          通过 {len(alive)}/{len(items)}\n"))
 
     if not alive:
         print(red("全部连不上。请检查网络,或确认端口没被封。"))
-        return 1
+        return None
 
     # 3. 多轮采样(轮内随机顺序,消除位置偏差)
-    print(gray(f"阶段 2/3  TLS + 首字节,共 {rounds} 轮 ..."))
+    n_alive = len(alive)
+    print(gray(f"阶段 2/3  TLS + 首字节,共 {rounds} 轮 × {n_alive} 个 ..."))
     samples = {k: [] for k in alive}
     meta = {}
     rng = random.Random()
-    par = min(24, max(1, len(alive)))
-
-    def one(key):
-        t, ip, p = key
-        return key, http_probe(ip, p, worker)
+    par = min(24, max(1, n_alive))
 
     for rd in range(rounds):
         order = alive[:]
         rng.shuffle(order)
+        done_rd = 0
         with ThreadPoolExecutor(max_workers=par) as ex:
-            for key, r in ex.map(one, order):
+            futs = {ex.submit(http_probe, ip, p, worker): key for key in order for t, ip, p in [key]}
+            for fu in as_completed(futs):
+                key = futs[fu]
+                r = fu.result()
+                done_rd += 1
+                progress(f"轮 {rd+1}/{rounds}  {done_rd}/{n_alive}")
                 meta[key] = r
                 if r["ok"]:
                     samples[key].append(r["ttfb"])
-        progress(f"{rd+1}/{rounds}")
-    clear_progress()
+        clear_progress()
+        print(gray(f"          轮 {rd+1}/{rounds} 完成"))
 
     rows = []
     need = min(rounds, max(2, rounds // 3))
@@ -473,18 +502,12 @@ def run(targets, worker, rounds, do_speed, ports, threads):
 
     good = [r for r in rows if r["ok"]]
     good.sort(key=lambda r: r["med"])
+    bad = [r for r in rows if not r["ok"]]
+    return good, bad, rows, t_start
 
-    # 4. 带宽(只测前若干名,串行避免抢带宽)
-    if do_speed and good:
-        topn = min(10, len(good))
-        print(gray(f"阶段 3/3  下载带宽,串行测前 {topn} 名 ..."))
-        for i, r in enumerate(good[:topn], 1):
-            r["mbps"] = speed_test(r["ip"], r["port"])
-            progress(f"{i}/{topn}  {r['ip']}  "
-                     f"{(str(r['mbps'])+' Mbps') if r['mbps'] else '失败'}")
-        clear_progress(60)
 
-    # ---------- 输出 ----------
+def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
+    """打印结果表格、机房统计、可复制列表,并保存 CSV/TXT"""
     print()
     print("=" * 78)
     print(bold(" 结果(按首字节延迟排序)"))
@@ -510,7 +533,6 @@ def run(targets, worker, rounds, do_speed, ports, threads):
     if len(good) > len(show):
         print(gray(f"… 其余 {len(good)-len(show)} 个可用结果见 CSV"))
 
-    bad = [r for r in rows if not r["ok"]]
     if bad:
         print()
         print(gray(f"不可用 {len(bad)} 个:"))
@@ -530,9 +552,16 @@ def run(targets, worker, rounds, do_speed, ports, threads):
         if len(good) >= 3:
             print(gray("提示:前几名差距常在噪声范围内,建议挑 2~3 个轮换使用。"))
 
+        # 可直接复制使用的地址列表
+        print()
+        print("-" * 78)
+        print(bold(" 可直接复制使用(域名/IP:端口)"))
+        print("-" * 78)
+        for r in good[:20]:
+            print(f"{r['target']}:{r['port']}")
+
     # ---------- 存盘 ----------
-    out = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
-                       f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    out = os.path.join(out_dir, f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     try:
         with open(out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
@@ -548,15 +577,12 @@ def run(targets, worker, rounds, do_speed, ports, threads):
     except Exception as e:
         print(yellow(f"\n保存失败: {e}"))
 
-    out_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir)
+    _save_txt(good, bad, worker, rounds, ports, do_speed, t_start, out_dir)
 
     print(gray(f"总耗时 {time.time()-t_start:.0f}s"))
-    return 0
-    return 0
 
 
-def _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
+def _save_txt(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
     """同时写一份人类可读的 txt 报告"""
     txt = os.path.join(out_dir, f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.txt")
     lines = []
@@ -564,8 +590,8 @@ def _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir
     lines.append("  CF 优选测速结果")
     lines.append("=" * 70)
     lines.append(f"Worker:   {worker}")
-    lines.append(f"目标:     {len(rows)} 个")
-    lines.append(f"端口:     {','.join(map(str, ports))}")
+    lines.append(f"目标:     {len(good) + len(bad)} 个")
+    lines.append(f"端口池:   {','.join(map(str, ports))} (每个目标随机1个)")
     lines.append(f"采样轮数: {rounds}")
     lines.append(f"带宽测试: {'是' if do_speed else '否'}")
     lines.append("")
@@ -591,6 +617,13 @@ def _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir
         lines.append(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  中位 {best['med']:.0f}ms")
         lines.append("")
 
+        lines.append("-" * 70)
+        lines.append(" 可直接复制使用(域名/IP:端口)")
+        lines.append("-" * 70)
+        for r in good[:20]:
+            lines.append(f"{r['target']}:{r['port']}")
+        lines.append("")
+
     if bad:
         lines.append(f"不可用 {len(bad)} 个:")
         for r in bad[:20]:
@@ -606,8 +639,6 @@ def _save_txt(rows, good, bad, worker, rounds, ports, do_speed, t_start, out_dir
         print(gray(f"文本报告: {txt}"))
     except Exception as e:
         print(yellow(f"文本报告保存失败: {e}"))
-    return txt
-    return 0
 
 
 def split_text(text):
@@ -640,7 +671,8 @@ def parse_ports(text):
     t = (text or "").strip().lower()
     if not t:
         return list(DEFAULT_PORTS)
-    if t in ("all", "全部", "*", "a"):
+    if t in ("all", "全部", "*", "a", "random", "rand", "r", "随机"):
+        # 返回全部可用端口池;每个目标在 run() 里单独随机抽 1 个
         return list(ALL_PORTS)
     out = []
     for x in t.replace(",", " ").replace("，", " ").split():
@@ -742,13 +774,28 @@ def interactive():
         rounds = 1
     rounds = max(1, min(rounds, 30))
 
-    ans = input("是否测下载带宽?(较慢,建议只在选出候选后测)[y/N]: ").strip().lower()
-    do_speed = ans in ("y", "yes", "是")
-
-    print(gray("可选端口: " + " ".join(str(p) for p in ALL_PORTS) + "(输入 all 用全部)"))
+    print(gray("可选端口池: " + " ".join(str(p) for p in ALL_PORTS) + " (每个目标随机1个,回车=443)"))
     ports = parse_ports(input("端口 [443]: "))
 
-    return run(targets, worker, rounds, do_speed, ports, 60)
+    out_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    result = run(targets, worker, rounds, ports, 60)
+    if result is None:
+        return 1
+    good, bad, rows, t_start = result
+    show_results(good, bad, worker, rounds, ports, False, t_start, out_dir)
+
+    if good:
+        ans = input("\n是否继续测下载带宽?[y/N]: ").strip().lower()
+        if ans in ("y", "yes", "是"):
+            try:
+                topn = int(input(f"测前几名?(最多 {len(good)} 个)[10]: ").strip() or "10")
+            except ValueError:
+                topn = 10
+            topn = max(1, min(topn, len(good)))
+            run_speed_batch(good, topn)
+            show_results(good, bad, worker, rounds, ports, True, t_start, out_dir)
+
+    return 0
 
 
 def main():
@@ -766,7 +813,7 @@ def main():
     ap.add_argument("-r", "--rounds", type=int, default=1, help="采样轮数,默认 1")
     ap.add_argument("-s", "--speed", action="store_true", help="测下载带宽")
     ap.add_argument("-p", "--ports", default="443",
-                    help="端口,默认 443;输入 all 表示全部 6 个: "
+                    help="端口,默认 443;输入 random 随机抽 3 个: "
                          + " ".join(str(p) for p in ALL_PORTS))
     ap.add_argument("-n", "--threads", type=int, default=60, help="并发数")
     ap.add_argument("-v", "--version", action="version", version=f"cfspeed {VERSION}")
@@ -804,8 +851,16 @@ def main():
         if not targets:
             print(red("没有有效目标。"))
             return 1
-        ports = [int(x) for x in args.ports.replace(",", " ").split() if x.isdigit()] or [443]
-        return run(targets, args.worker, max(1, args.rounds), args.speed, ports, args.threads)
+        ports = parse_ports(args.ports)
+        out_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        result = run(targets, args.worker, max(1, args.rounds), ports, args.threads)
+        if result is None:
+            return 1
+        good, bad, rows, t_start = result
+        if args.speed and good:
+            run_speed_batch(good, min(10, len(good)))
+        show_results(good, bad, args.worker, args.rounds, ports, args.speed, t_start, out_dir)
+        return 0
     except KeyboardInterrupt:
         print(yellow("\n已取消。"))
         return 130
