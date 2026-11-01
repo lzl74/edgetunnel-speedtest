@@ -71,8 +71,6 @@ PRESETS = {}
 if P is not None:
     if getattr(P, "DOMAINS", None):
         PRESETS["domains"] = (f"优选域名 ({len(P.DOMAINS)} 个,多源交叉验证)", P.DOMAINS, False)
-    if getattr(P, "IPS", None):
-        PRESETS["ips"] = (f"当日优选 IP ({len(P.IPS)} 个,最快)", P.IPS, False)
     if getattr(P, "CIDRS", None):
         PRESETS["cidrs"] = (f"Cloudflare 网段 ({len(P.CIDRS)} 个,抽样扫描)", P.CIDRS, True)
 

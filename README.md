@@ -100,7 +100,7 @@ cfspeed.py -f list.txt -r 8 -s
 | `-t, --targets` | 目标列表，逗号或空格分隔，IP 和域名都行，可带端口 |
 | `-f, --file` | 从文件读取，每行一个 |
 | `-c, --cidr` | 扫描网段，如 `162.159.38.0/24` |
-| `--preset` | 内置预设：`domains` / `ips` / `cidrs` |
+| `--preset` | 内置预设：`domains` / `cidrs` |
 | `-w, --worker` | **Worker 域名**（SNI 与 Host），**必填**，也可用环境变量 `CF_WORKER` |
 | `-r, --rounds` | 采样轮数，默认 1 |
 | `-s, --speed` | 额外测下载带宽（交互模式会在出结果后询问） |
@@ -112,14 +112,14 @@ cfspeed.py -f list.txt -r 8 -s
 | 预设 | 内容 | 耗时 |
 |---|---|---|
 | `domains` | **优选域名** 1280 个 —— 在多个公开源中交叉出现过的域名，质量优先 | 约 4 分钟 |
-| `ips` | **当日优选 IP** 52 个 —— 公开优选站当日实测可用的边缘 IP，最快 | 约 5 秒 |
 | `cidrs` | **Cloudflare 网段** 1426 个 —— 官方 15 段 + 社区细分，抽样扫描 | 约 20 秒 |
 
 预设只是**候选清单**，具体哪个好还是要在你的网络下实测。数据来源：
 
 - 域名：[GuangYu-yu/About-Cloudflare](https://github.com/GuangYu-yu/About-Cloudflare)、[beiye935/YouXuanIPAndYuming](https://github.com/beiye935/YouXuanIPAndYuming)、[Onezyh/SUB-Panel](https://github.com/Onezyh/SUB-Panel)、[king4107/suju](https://github.com/king4107/suju) 等公开列表交叉去重，只保留多源重合项
-- IP：公开优选站的当日实测结果（会随时间变化，建议定期重新拉取）
 - 网段：[Cloudflare 官方 IPv4 列表](https://www.cloudflare.com/ips-v4) + 社区细分
+
+> 这里不放「当日优选 IP」这类快照——它们几天就失效了，放在仓库里反而误导人。自己的网络自己测，结果才准。
 
 ---
 
