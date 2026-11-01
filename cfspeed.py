@@ -403,26 +403,42 @@ def run(targets, worker, rounds, ports, threads):
     print(bold(f"目标 {len(targets)} 个 | 采样 {rounds} 轮 | 端口池 {','.join(map(str, ports))}(每个目标随机1个)"))
     print()
 
-    # 1. 解析
+    # 1. 解析(并发 DNS,1280 个域名也能在几十秒内完成)
     items = []          # (显示名, ip, 端口)
     rejected = []
     n_total = len(targets)
-    print(gray(f"阶段 0/3  解析目标(共 {n_total} 个,域名需 DNS 查询,可能较慢) ..."))
-    for idx, entry in enumerate(targets, 1):
+
+    # 先探一下 DNS 是否正常,避免 1280 个目标全部解析失败后才发现
+    if not resolve("cloudflare.com"):
+        print(yellow("警告: DNS 解析 cloudflare.com 失败,你的网络/DNS 可能有问题"))
+        print(gray("  若开着代理/VPN,建议关闭后重测;或换个 DNS(如 223.5.5.5)再试"))
+        print()
+
+    print(gray(f"阶段 0/3  解析目标(共 {n_total} 个,并发 DNS) ..."))
+
+    def _resolve_one(entry):
         t, tport = entry if isinstance(entry, tuple) else (entry, None)
-        progress(f"解析 {idx}/{n_total}  {t}")
-        ips = resolve(t)
-        if not ips:
-            rejected.append((t, "DNS 解析失败"))
-            continue
-        good = [ip for ip in ips if is_cf(ip)]
-        if not good:
-            rejected.append((t, f"非 Cloudflare IP ({ips[0]})"))
-            continue
-        plist = [tport] if tport else [random.choice(ports)]
-        for ip in good[:2]:
-            for p in plist:
-                items.append((t, ip, p))
+        return entry, resolve(t)
+
+    dns_workers = min(32, max(4, n_total))
+    done = 0
+    with ThreadPoolExecutor(max_workers=dns_workers) as ex:
+        for entry, ips in ex.map(_resolve_one, targets):
+            t, tport = entry if isinstance(entry, tuple) else (entry, None)
+            done += 1
+            if done % 20 == 0 or done == n_total:
+                progress(f"解析 {done}/{n_total}")
+            if not ips:
+                rejected.append((t, "DNS 解析失败"))
+                continue
+            good = [ip for ip in ips if is_cf(ip)]
+            if not good:
+                rejected.append((t, f"非 Cloudflare IP ({ips[0]})"))
+                continue
+            plist = [tport] if tport else [random.choice(ports)]
+            for ip in good[:2]:
+                for p in plist:
+                    items.append((t, ip, p))
     clear_progress()
 
     if rejected:
@@ -434,7 +450,18 @@ def run(targets, worker, rounds, ports, threads):
         print()
 
     if not items:
-        print(red("没有可测试的目标。"))
+        dns_fail = sum(1 for _, why in rejected if why.startswith("DNS"))
+        non_cf = len(rejected) - dns_fail
+        print(red(f"没有可测试的目标 —— {n_total} 个全部在解析阶段被淘汰"))
+        print(red(f"  原因统计: DNS 解析失败 {dns_fail} 个 | 解析到非 Cloudflare IP {non_cf} 个"))
+        if dns_fail > n_total * 0.8:
+            print(yellow("  → 绝大多数是 DNS 失败,基本可以确定是你本地 DNS 的问题:"))
+            print(gray("     1) 关掉代理/VPN 再试(代理常会劫持 DNS)"))
+            print(gray("     2) 把 DNS 换成 223.5.5.5 / 119.29.29.29 后重试"))
+            print(gray("     3) 命令行验证: nslookup cloudflare.com"))
+        elif non_cf > n_total * 0.8:
+            print(yellow("  → 绝大多数解析到非 CF 的 IP,这些域名可能已经不走 Cloudflare 了"))
+            print(gray("     可改用 --preset cidrs 直接扫网段"))
         return None
 
     # 2. TCP 快筛
@@ -453,7 +480,16 @@ def run(targets, worker, rounds, ports, threads):
     print(gray(f"          通过 {len(alive)}/{len(items)}\n"))
 
     if not alive:
-        print(red("全部连不上。请检查网络,或确认端口没被封。"))
+        port_use = {}
+        for _, _, p in items:
+            port_use[p] = port_use.get(p, 0) + 1
+        print(red(f"全部连不上 —— {len(items)} 个 IP:端口组合无一响应"))
+        print(red("  本次使用的端口分布: " + ", ".join(f"{p}×{n}" for p, n in sorted(port_use.items()))))
+        print(yellow("  可能原因:"))
+        print(gray("     1) 本地网络/防火墙拦了出站连接(试试关掉杀毒/代理再测)"))
+        print(gray("     2) 非 443 端口在你这里被运营商封锁"))
+        print(gray("        → 加参数 -p 443 只测标准端口"))
+        print(gray("     3) 网络本身不通,先确认浏览器能打开任意网站"))
         return None
 
     # 3. 多轮采样(轮内随机顺序,消除位置偏差)
