@@ -70,11 +70,14 @@ except Exception:
 PRESETS = {}
 if P is not None:
     if getattr(P, "DOMAINS", None):
-        PRESETS["domains"] = (f"优选域名 ({len(P.DOMAINS)} 个)", P.DOMAINS, False)
+        PRESETS["domains"] = (f"优选域名 · 多源验证 ({len(P.DOMAINS)} 个)", P.DOMAINS, False)
+    if getattr(P, "DOMAINS_BIG", None):
+        PRESETS["domains_big"] = (f"优选域名 · 全量 ({len(P.DOMAINS_BIG)} 个,很慢,约 30~60 分钟)",
+                                  P.DOMAINS_BIG, False)
     if getattr(P, "IPS", None):
-        PRESETS["ips"] = (f"指定 IP ({len(P.IPS)} 个)", P.IPS, False)
+        PRESETS["ips"] = (f"当日优选 IP ({len(P.IPS)} 个,最快)", P.IPS, False)
     if getattr(P, "CIDRS", None):
-        PRESETS["cidrs"] = (f"Cloudflare 网段 ({len(P.CIDRS)} 个,抽样扫描,较慢)", P.CIDRS, True)
+        PRESETS["cidrs"] = (f"Cloudflare 网段 ({len(P.CIDRS)} 个,抽样扫描)", P.CIDRS, True)
 
 # ---------- Cloudflare 官方 IPv4 网段(用于判断域名是否真的走 CF) ----------
 CF_NETS = [ipaddress.ip_network(n) for n in [
