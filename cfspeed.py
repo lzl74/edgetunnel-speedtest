@@ -70,10 +70,7 @@ except Exception:
 PRESETS = {}
 if P is not None:
     if getattr(P, "DOMAINS", None):
-        PRESETS["domains"] = (f"优选域名 · 多源验证 ({len(P.DOMAINS)} 个)", P.DOMAINS, False)
-    if getattr(P, "DOMAINS_BIG", None):
-        PRESETS["domains_big"] = (f"优选域名 · 全量 ({len(P.DOMAINS_BIG)} 个,很慢,约 30~60 分钟)",
-                                  P.DOMAINS_BIG, False)
+        PRESETS["domains"] = (f"优选域名 ({len(P.DOMAINS)} 个,多源交叉验证)", P.DOMAINS, False)
     if getattr(P, "IPS", None):
         PRESETS["ips"] = (f"当日优选 IP ({len(P.IPS)} 个,最快)", P.IPS, False)
     if getattr(P, "CIDRS", None):
