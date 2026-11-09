@@ -64,10 +64,11 @@ pyinstaller --onefile --console --name cfspeed cfspeed.py
 Worker 域名(SNI/Host,必填,如 xxx.cfpages.dev):
 
 输入方式:
-  [1] 使用内置预设
-  [2] 直接粘贴 IP 或域名(多行,空行结束)
-  [3] 从文件读取
-  [4] 扫描网段(如 162.159.38.0/24)
+  [1] 在线获取最新预设(实时抓取优选域名+IP,推荐)
+  [2] 使用内置预设
+  [3] 直接粘贴 IP 或域名(多行,空行结束)
+  [4] 从文件读取
+  [5] 扫描网段(如 162.159.38.0/24)
 
 采样轮数 [1]:
 端口池: 443 2053 2083 2087 2096 8443 (默认随机:每个目标随机1个;可指定,如 443,2053)
@@ -79,7 +80,10 @@ Worker 域名(SNI/Host,必填,如 xxx.cfpages.dev):
 ### 命令行
 
 ```bash
-# 用内置预设（最省事）
+# 在线抓取最新优选（推荐,每次运行实时获取）
+cfspeed.py --preset online -w 你的域名
+
+# 用内置静态预设（离线可用）
 cfspeed.py --preset domains -w 你的域名
 
 # 测指定的 IP / 域名
@@ -100,26 +104,28 @@ cfspeed.py -f list.txt -r 8 -s
 | `-t, --targets` | 目标列表，逗号或空格分隔，IP 和域名都行，可带端口 |
 | `-f, --file` | 从文件读取，每行一个 |
 | `-c, --cidr` | 扫描网段，如 `162.159.38.0/24` |
-| `--preset` | 内置预设：`domains` / `cidrs` |
+| `--preset` | `online`（实时抓取最新优选，推荐） / `domains` / `cidrs` |
 | `-w, --worker` | **Worker 域名**（SNI 与 Host），**必填**，也可用环境变量 `CF_WORKER` |
 | `-r, --rounds` | 采样轮数，默认 1 |
 | `-s, --speed` | 额外测下载带宽（交互模式会在出结果后询问） |
 | `-p, --ports` | 端口池，默认 `all` = 全部 6 个端口、每个目标随机用 1 个；也可指定，如 `443,2053` |
 | `-n, --threads` | 并发数，默认 60 |
 
-### 内置预设
+### 预设
 
-| 预设 | 内容 | 耗时 |
+| 预设 | 内容 | 说明 |
 |---|---|---|
-| `domains` | **优选域名** 1280 个 —— 在多个公开源中交叉出现过的域名，质量优先 | 约 4 分钟 |
-| `cidrs` | **Cloudflare 网段** 1426 个 —— 官方 15 段 + 社区细分，抽样扫描 | 约 20 秒 |
+| `online` | **实时抓取**：最新优选域名 + 优选 IP + 官方网段抽样 | 每次运行从公开源现拉，天然不会过期；失败自动回退 7 天内缓存 → 内置预设 |
+| `domains` | **内置优选域名** —— 在多个公开源中交叉出现过的域名，质量优先 | 静态清单，会随时间失效 |
+| `cidrs` | **Cloudflare 网段** —— 官方 15 段 + 社区细分，抽样扫描 | 抽样扫描用 |
 
-预设只是**候选清单**，具体哪个好还是要在你的网络下实测。数据来源：
+`online` 的数据来源（直连不通会自动换镜像重试）：
 
-- 域名：[GuangYu-yu/About-Cloudflare](https://github.com/GuangYu-yu/About-Cloudflare)、[beiye935/YouXuanIPAndYuming](https://github.com/beiye935/YouXuanIPAndYuming)、[Onezyh/SUB-Panel](https://github.com/Onezyh/SUB-Panel)、[king4107/suju](https://github.com/king4107/suju) 等公开列表交叉去重，只保留多源重合项
-- 网段：[Cloudflare 官方 IPv4 列表](https://www.cloudflare.com/ips-v4) + 社区细分
+- 优选域名：[beiye935/YouXuanIPAndYuming](https://github.com/beiye935/YouXuanIPAndYuming)（精选优先）、[GuangYu-yu/About-Cloudflare](https://github.com/GuangYu-yu/About-Cloudflare)（随机抽样补足）
+- 优选 IP：[beiye935/YouXuanIPAndYuming](https://github.com/beiye935/YouXuanIPAndYuming) `ipv4.txt`（IP:端口）
+- 网段抽样：[Cloudflare 官方 IPv4 列表](https://www.cloudflare.com/ips-v4)，每个 /24 随机抽 1 个
 
-> 这里不放「当日优选 IP」这类快照——它们几天就失效了，放在仓库里反而误导人。自己的网络自己测，结果才准。
+> 这里不放「当日优选 IP」这类快照——它们几天就失效了。选 `online` 每次现抓现测，自己的网络自己测，结果才准。
 
 ---
 

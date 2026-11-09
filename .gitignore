@@ -12,6 +12,7 @@ dist/
 
 # 运行产物
 cfspeed.cfg
+cfspeed_online.json
 cfspeed_*.csv
 cfspeed_*.txt
 result*.csv

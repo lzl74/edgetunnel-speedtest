@@ -12,13 +12,15 @@ CF 优选测速器 (cfspeed)
 用法:
     双击运行(交互式)     直接跑,按提示输入
     命令行:
+        cfspeed.py --preset online -w 你的域名     # 每次实时抓取最新优选
         cfspeed.py --preset domains -w 你的域名
         cfspeed.py -t 1.2.3.4,example.com -w 你的域名.workers.dev
         cfspeed.py -f list.txt -r 8 -s
         cfspeed.py -c 162.159.38.0/24 -w 你的域名
 
-内置预设(--preset):
-    domains  优选域名列表(426 个)
+预设(--preset):
+    online   每次运行从多个公开源实时抓取最新优选域名/IP(推荐,失败自动回退)
+    domains  内置优选域名列表(静态,会随时间失效)
     cidrs    Cloudflare 网段池(抽样扫描)
 
 参数:
@@ -43,15 +45,17 @@ import ipaddress
 import json
 import os
 import random
+import re
 import socket
 import ssl
 import statistics
 import sys
 import time
 import unicodedata
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.5"
+VERSION = "1.6"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
@@ -73,6 +77,197 @@ if P is not None:
         PRESETS["domains"] = (f"优选域名 ({len(P.DOMAINS)} 个,多源交叉验证)", P.DOMAINS, False)
     if getattr(P, "CIDRS", None):
         PRESETS["cidrs"] = (f"Cloudflare 网段 ({len(P.CIDRS)} 个,抽样扫描)", P.CIDRS, True)
+
+# ---------- 在线预设源(每次运行实时抓取,失败回退缓存/内置) ----------
+ONLINE_TIMEOUT = 12
+CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "cfspeed_online.json")
+
+# 优选域名源(排在前面的优先保留)
+ONLINE_DOMAIN_SOURCES = [
+    ("beiye935 优选域名", "https://raw.githubusercontent.com/beiye935/YouXuanIPAndYuming/main/Cloudflare%E4%BC%98%E9%80%89%E5%9F%9F%E5%90%8D.txt"),
+    ("GuangYu-yu 优选域名", "https://raw.githubusercontent.com/GuangYu-yu/About-Cloudflare/main/%E4%BC%98%E9%80%89%E5%9F%9F%E5%90%8D.txt"),
+]
+# 优选 IP 源(格式: IP:端口#备注)
+ONLINE_IP_SOURCES = [
+    ("beiye935 优选IP", "https://raw.githubusercontent.com/beiye935/YouXuanIPAndYuming/main/ipv4.txt"),
+]
+# Cloudflare 官方网段(用于随机抽样一批新鲜 IP)
+ONLINE_CIDR_SOURCES = [
+    ("Cloudflare 官方网段", "https://www.cloudflare.com/ips-v4"),
+]
+
+# GitHub 直连不通时的镜像前缀(依次尝试)
+FETCH_MIRRORS = ("", "https://ghproxy.net/", "https://ghfast.top/")
+
+_DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+def _fetch_url(url):
+    """抓取文本,直连失败自动换镜像"""
+    for mirror in FETCH_MIRRORS:
+        try:
+            req = urllib.request.Request(mirror + url,
+                                         headers={"User-Agent": f"cfspeed/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=ONLINE_TIMEOUT) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            continue
+    return None
+
+
+def _clean_domain(line):
+    s = line.strip().lower()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("#")[0].split("/")[0].strip()
+    if s.count(":") == 1:
+        s = s.rsplit(":", 1)[0]
+    return s if _DOMAIN_RE.match(s) else None
+
+
+def _clean_ip_target(line):
+    """IP 或 IP:端口(忽略 # 后注释)"""
+    s = line.strip().split("#")[0].strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/")[0]
+    if not s:
+        return None
+    host, _, port = s.partition(":")
+    if port and not port.isdigit():
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return f"{host}:{port}" if port else host
+
+
+def _clean_cidr(line):
+    s = line.strip().split("#")[0].strip()
+    try:
+        ipaddress.ip_network(s, strict=False)
+        return s
+    except ValueError:
+        return None
+
+
+def sample_ips_from_cidrs(cidr_texts, count=60):
+    """从网段里随机抽 count 个 /24 各 1 个 IP,得到一批新鲜候选"""
+    pools = []
+    for c in cidr_texts:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            continue
+        subs = list(net.subnets(new_prefix=24)) if net.prefixlen < 24 else [net]
+        pools.extend(subs)
+    random.shuffle(pools)
+    out = []
+    for sub in pools[:count]:
+        out.append(str(ipaddress.IPv4Address(int(sub.network_address) + random.randint(1, 254))))
+    return out
+
+
+def load_online_cache(max_age=7 * 86400):
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if time.time() - d.get("time", 0) > max_age:
+            return None
+        return d
+    except Exception:
+        return None
+
+
+def fetch_online(cap_domains=500, cap_ips=200):
+    """
+    实时抓取最新优选数据。
+    返回 (targets, note) —— targets 为字符串列表;全部失败时返回 ([], 原因)
+    """
+    print(gray("正在从网络获取最新优选数据 ..."))
+    jobs = ([("d", n, u) for n, u in ONLINE_DOMAIN_SOURCES]
+            + [("i", n, u) for n, u in ONLINE_IP_SOURCES]
+            + [("c", n, u) for n, u in ONLINE_CIDR_SOURCES])
+    cleaner = {"d": _clean_domain, "i": _clean_ip_target, "c": _clean_cidr}
+
+    got_domains = {}       # 源序号 -> [域名]
+    got_ip, got_cidr = [], []
+    ok_any = False
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = {ex.submit(_fetch_url, u): (k, n, i)
+                for i, (k, n, u) in enumerate(jobs)}
+        for fu in as_completed(futs):
+            k, n, i = futs[fu]
+            text = fu.result()
+            if not text:
+                print(gray(f"  {n}: 获取失败"))
+                continue
+            ok_any = True
+            items = [v for v in (cleaner[k](ln) for ln in text.splitlines()) if v]
+            print(gray(f"  {n}: {len(items)} 条"))
+            if k == "d":
+                got_domains[i] = items
+            elif k == "i":
+                got_ip = items
+            else:
+                got_cidr = items
+
+    if not ok_any:
+        return [], "所有在线源都获取失败"
+
+    # 域名:精选源(源列表顺序靠前)优先保留,超出上限随机抽样
+    domains, budget = [], cap_domains
+    for i in range(len(ONLINE_DOMAIN_SOURCES)):
+        lst = list(dict.fromkeys(got_domains.get(i, [])))
+        if not lst:
+            continue
+        if len(lst) > budget:
+            lst = random.sample(lst, budget)
+        domains.extend(lst)
+        budget -= len(lst)
+        if budget <= 0:
+            break
+
+    ips = list(dict.fromkeys(got_ip))
+    if len(ips) > cap_ips:
+        ips = random.sample(ips, cap_ips)
+    # 官方网段抽样,补一批新鲜裸 IP
+    if got_cidr:
+        ips += sample_ips_from_cidrs(list(dict.fromkeys(got_cidr)), count=60)
+
+    targets = domains + ips
+    if not targets:
+        return [], "在线源返回的数据解析后为空"
+    return targets, f"域名 {len(domains)} + IP {len(ips)}"
+
+
+def online_targets(cap_domains=500, cap_ips=200):
+    """在线抓取 → 成功则存缓存;失败回退 7 天内缓存 → 内置预设"""
+    targets, note = fetch_online(cap_domains, cap_ips)
+    if targets:
+        print(gray(f"  合计: {note}"))
+        try:
+            with open(CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"time": time.time(), "targets": targets}, f)
+        except Exception:
+            pass
+        return build_targets(targets)
+
+    cache = load_online_cache()
+    if cache:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(cache["time"]))
+        print(yellow(f"  在线获取失败({note}),改用 {ts} 的缓存({len(cache.get('targets', []))} 条)"))
+        return build_targets(cache.get("targets", []))
+
+    if P is not None and getattr(P, "DOMAINS", None):
+        print(yellow(f"  在线获取失败({note})且无缓存,回退到内置预设"))
+        return build_targets(P.DOMAINS)
+
+    print(red(f"  在线获取失败: {note}"))
+    return []
+
 
 # ---------- Cloudflare 官方 IPv4 网段(用于判断域名是否真的走 CF) ----------
 CF_NETS = [ipaddress.ip_network(n) for n in [
@@ -540,6 +735,20 @@ def run(targets, worker, rounds, ports, threads):
     return good, bad, rows, t_start
 
 
+def unique_targets(rows, limit=20):
+    """按目标去重:同一域名解析出的多个 IP 只保留最快的一条,避免复制列表重复"""
+    seen, out = set(), []
+    for r in rows:
+        key = str(r["target"]).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
 def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
     """打印结果表格、机房统计、可复制列表,并保存 CSV/TXT"""
     print()
@@ -586,12 +795,13 @@ def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
         if len(good) >= 3:
             print(gray("提示:前几名差距常在噪声范围内,建议挑 2~3 个轮换使用。"))
 
-        # 可直接复制使用的地址列表
+        # 可直接复制使用的地址列表(按目标去重)
+        uniq = unique_targets(good, 20)
         print()
         print("-" * 78)
-        print(bold(" 可直接复制使用(域名/IP:端口)"))
+        print(bold(f" 可直接复制使用(域名/IP:端口) — 去重后 {len(uniq)} 条"))
         print("-" * 78)
-        for r in good[:20]:
+        for r in uniq:
             print(f"{r['target']}:{r['port']}")
 
     # ---------- 存盘 ----------
@@ -651,10 +861,11 @@ def _save_txt(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
         lines.append(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  中位 {best['med']:.0f}ms")
         lines.append("")
 
+        uniq = unique_targets(good, 20)
         lines.append("-" * 70)
-        lines.append(" 可直接复制使用(域名/IP:端口)")
+        lines.append(f" 可直接复制使用(域名/IP:端口) — 去重后 {len(uniq)} 条")
         lines.append("-" * 70)
-        for r in good[:20]:
+        for r in uniq:
             lines.append(f"{r['target']}:{r['port']}")
         lines.append("")
 
@@ -772,19 +983,24 @@ def _interactive():
 
     print()
     print("输入方式:")
+    print("  [1] 在线获取最新预设(实时抓取优选域名+IP,推荐)")
     if PRESETS:
-        print("  [1] 使用内置预设")
-    print("  [2] 直接粘贴 IP 或域名(多行,空行结束)")
-    print("  [3] 从文件读取")
-    print("  [4] 扫描网段(如 162.159.38.0/24)")
+        print("  [2] 使用内置预设")
+    print("  [3] 直接粘贴 IP 或域名(多行,空行结束)")
+    print("  [4] 从文件读取")
+    print("  [5] 扫描网段(如 162.159.38.0/24)")
     mode = input("选择 [1]: ").strip() or "1"
 
     targets = []
-    if mode == "1" and PRESETS:
+    if mode == "1":
+        targets = online_targets()
+        if not targets:
+            return 1
+    elif mode == "2" and PRESETS:
         targets = choose_preset()
         if not targets:
             return 1
-    elif mode == "3":
+    elif mode == "4":
         path = input("文件路径: ").strip().strip('"')
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
@@ -792,7 +1008,7 @@ def _interactive():
         except Exception as e:
             print(red(f"读取失败: {e}"))
             return 1
-    elif mode == "4":
+    elif mode == "5":
         spec = input("网段: ").strip()
         try:
             targets = build_targets([spec])
@@ -854,8 +1070,8 @@ def main():
     ap.add_argument("-t", "--targets", help="IP/域名列表,逗号或空格分隔")
     ap.add_argument("-f", "--file", help="从文件读取目标")
     ap.add_argument("-c", "--cidr", help="扫描网段,如 162.159.38.0/24")
-    ap.add_argument("--preset", choices=(list(PRESETS) if PRESETS else None),
-                    help="使用内置预设: " + " / ".join(PRESETS) if PRESETS else "无预设")
+    ap.add_argument("--preset", choices=["online"] + list(PRESETS),
+                    help="预设: online=每次实时抓取最新优选(推荐) / " + " / ".join(PRESETS))
     ap.add_argument("-w", "--worker", default=os.environ.get("CF_WORKER", ""),
                     help="Worker 域名(SNI/Host),必填,也可用环境变量 CF_WORKER")
     ap.add_argument("-r", "--rounds", type=int, default=1, help="采样轮数,默认 1")
@@ -879,10 +1095,12 @@ def main():
 
         if not args.worker:
             print(red("缺少 -w 参数:必须指定你自己的 Worker 域名。"))
-            print(gray("  例如: cfspeed.py --preset domains -w abc.workers.dev"))
+            print(gray("  例如: cfspeed.py --preset online -w abc.workers.dev"))
             return 1
 
-        if args.preset:
+        if args.preset == "online":
+            targets = online_targets()
+        elif args.preset:
             if not PRESETS:
                 print(red("预设数据缺失。"))
                 return 1
