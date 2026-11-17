@@ -55,12 +55,15 @@ import unicodedata
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.8"
+VERSION = "1.9"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
 # Cloudflare 支持 HTTPS 的端口(全套);默认从中随机,每个目标 1 个
 ALL_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
+
+# 带宽低于此值(Mbps)的节点不进「可直接复制使用」列表
+SPEED_FLOOR = 10.0
 
 # 本地配置(记录上次填的 Worker 域名,不进入版本库)
 CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "cfspeed.cfg")
@@ -773,6 +776,11 @@ def unique_targets(rows, limit=20):
     return out
 
 
+def copy_pool(good):
+    """可复制列表的候选池:剔除测出带宽 ≤ SPEED_FLOOR 的节点(未测带宽的保留)"""
+    return [r for r in good if not r["mbps"] or r["mbps"] > SPEED_FLOOR]
+
+
 def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
     """打印结果表格、机房统计、可复制列表,并保存 CSV/TXT"""
     # 测过带宽:下载速度优先排序(速度降序,延迟做并列裁决);
@@ -826,14 +834,20 @@ def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
         if len(good) >= 3:
             print(gray("提示:前几名差距常在噪声范围内,建议挑 2~3 个轮换使用。"))
 
-        # 可直接复制使用的地址列表(按目标去重)
-        uniq = unique_targets(good, 20)
+        # 可直接复制使用的地址列表(按目标去重,剔除慢带宽节点)
+        pool = copy_pool(good)
+        dropped = len(good) - len(pool)
+        uniq = unique_targets(pool, 20)
         print()
         print("-" * 78)
-        print(bold(f" 可直接复制使用(域名/IP:端口) — 去重后 {len(uniq)} 条"))
+        note = f",已剔除 {dropped} 个带宽 ≤{SPEED_FLOOR:.0f} Mbps 的节点" if dropped else ""
+        print(bold(f" 可直接复制使用(域名/IP:端口) — 去重后 {len(uniq)} 条{note}"))
         print("-" * 78)
         for r in uniq:
             print(f"{r['target']}:{r['port']}")
+        if not uniq:
+            print(yellow(f"(所有测过带宽的节点都低于 {SPEED_FLOOR:.0f} Mbps,"
+                         f"可复制列表为空;建议多测几个节点或换个网络环境)"))
 
     # ---------- 存盘 ----------
     out = os.path.join(out_dir, f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.csv")
@@ -894,9 +908,12 @@ def _save_txt(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
                      f"中位 {best['med']:.0f}ms{best_mb}")
         lines.append("")
 
-        uniq = unique_targets(good, 20)
+        pool = copy_pool(good)
+        dropped = len(good) - len(pool)
+        uniq = unique_targets(pool, 20)
         lines.append("-" * 70)
-        lines.append(f" 可直接复制使用(域名/IP:端口) — 去重后 {len(uniq)} 条")
+        note = f",已剔除 {dropped} 个带宽 ≤{SPEED_FLOOR:.0f} Mbps 的节点" if dropped else ""
+        lines.append(f" 可直接复制使用(域名/IP:端口) — 去重后 {len(uniq)} 条{note}")
         lines.append("-" * 70)
         for r in uniq:
             lines.append(f"{r['target']}:{r['port']}")
