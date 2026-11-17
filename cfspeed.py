@@ -55,7 +55,7 @@ import unicodedata
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.6"
+VERSION = "1.7"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
@@ -462,16 +462,25 @@ def http_probe(ip, port, worker, timeout=TIMEOUT):
             pass
 
 
-def speed_test(ip, port, nbytes=5_000_000, timeout=20.0):
-    """经 speed.cloudflare.com 测这个 IP 的真实下行带宽(Mbps)"""
+def speed_test(ip, port, nbytes=5_000_000, max_seconds=8.0):
+    """经 speed.cloudflare.com 测这个 IP 的真实下行带宽(Mbps)
+
+    太慢的节点直接放弃,不空耗时间:
+      - 全程(连接+TLS+下载)超过 max_seconds 即中止;
+        已收数据够 200KB 就按已收部分估速,不够返回 None
+      - 1.5 秒后累计收不到 40KB(相当于 <0.2 Mbps),判定太慢,立即放弃
+    """
+    t0 = time.perf_counter()
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
+        s.settimeout(max_seconds)
         s.connect((ip, port))
         ctx = ssl.create_default_context()
         ctx.set_alpn_protocols(["http/1.1"])
         ss = ctx.wrap_socket(s, server_hostname="speed.cloudflare.com")
-        t0 = time.perf_counter()
+        s = None          # 所有权移交给 ss
+        ss.settimeout(3.0)
         ss.sendall(f"GET /__down?bytes={nbytes} HTTP/1.1\r\n"
                    f"Host: speed.cloudflare.com\r\nUser-Agent: cfspeed/{VERSION}\r\n"
                    f"Connection: close\r\n\r\n".encode())
@@ -483,8 +492,14 @@ def speed_test(ip, port, nbytes=5_000_000, timeout=20.0):
             buf += ch
         body = buf.split(b"\r\n\r\n", 1)[-1]
         total = len(body)
-        ss.settimeout(4.0)
+        t_dl = time.perf_counter()      # 下载阶段起点(不含连接/TLS 耗时)
         while total < nbytes:
+            el_dl = time.perf_counter() - t_dl
+            if el_dl > 1.5 and total < 40_000:
+                total = 0               # 起步就太慢,按失败处理
+                break
+            if time.perf_counter() - t0 > max_seconds:
+                break                   # 总时长超限,按已收数据估速
             try:
                 ch = ss.recv(262144)
             except Exception:
@@ -492,13 +507,22 @@ def speed_test(ip, port, nbytes=5_000_000, timeout=20.0):
             if not ch:
                 break
             total += len(ch)
-        el = time.perf_counter() - t0
-        ss.close()
+        el = time.perf_counter() - t_dl
+        try:
+            ss.close()
+        except Exception:
+            pass
         if total < 200_000:
             return None
         return round(total * 8 / el / 1_000_000, 2)
     except Exception:
         return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 # ---------- 目标解析 ----------
@@ -586,7 +610,7 @@ def run_speed_batch(good, topn):
     for i, r in enumerate(good[:topn], 1):
         r["mbps"] = speed_test(r["ip"], r["port"])
         progress(f"{i}/{topn}  {r['ip']}:{r['port']}  "
-                 f"{(str(r['mbps'])+' Mbps') if r['mbps'] else '失败'}")
+                 f"{(str(r['mbps'])+' Mbps') if r['mbps'] else '太慢,已跳过'}")
     clear_progress(60)
 
 
