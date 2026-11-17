@@ -55,7 +55,7 @@ import unicodedata
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.7"
+VERSION = "1.8"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
@@ -775,9 +775,15 @@ def unique_targets(rows, limit=20):
 
 def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
     """打印结果表格、机房统计、可复制列表,并保存 CSV/TXT"""
+    # 测过带宽:下载速度优先排序(速度降序,延迟做并列裁决);
+    # 未测带宽:按首字节延迟排序
+    by_speed = any(r["mbps"] for r in good)
+    if by_speed:
+        good.sort(key=lambda r: (0, -r["mbps"], r["med"]) if r["mbps"]
+                  else (1, 0, r["med"]))
     print()
     print("=" * 78)
-    print(bold(" 结果(按首字节延迟排序)"))
+    print(bold(" 结果(按下载带宽排序)" if by_speed else " 结果(按首字节延迟排序)"))
     print("=" * 78)
     hdr = (pad("#", 3, ">") + " " + pad("目标", 24) + pad("IP", 17) +
            pad("机房", 6, ">") + pad("端口", 6, ">") + pad("中位", 8, ">") +
@@ -814,8 +820,9 @@ def show_results(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
         print("机房分布: " + "  ".join(f"{k} {v}个" for k, v in
                                     sorted(colos.items(), key=lambda x: -x[1])))
         best = good[0]
+        best_mb = (f"  {best['mbps']:.1f} Mbps" if best["mbps"] else "")
         print(bold(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  "
-                   f"中位 {best['med']:.0f}ms"))
+                   f"中位 {best['med']:.0f}ms{best_mb}"))
         if len(good) >= 3:
             print(gray("提示:前几名差距常在噪声范围内,建议挑 2~3 个轮换使用。"))
 
@@ -882,7 +889,9 @@ def _save_txt(good, bad, worker, rounds, ports, do_speed, t_start, out_dir):
         lines.append("机房分布: " + "  ".join(f"{k} {v}个" for k, v in
                                             sorted(colos.items(), key=lambda x: -x[1])))
         best = good[0]
-        lines.append(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  中位 {best['med']:.0f}ms")
+        best_mb = (f"  {best['mbps']:.1f} Mbps" if best["mbps"] else "")
+        lines.append(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  "
+                     f"中位 {best['med']:.0f}ms{best_mb}")
         lines.append("")
 
         uniq = unique_targets(good, 20)
