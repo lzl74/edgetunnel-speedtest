@@ -55,7 +55,7 @@ import unicodedata
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.9"
+VERSION = "2.0"
 DEFAULT_WORKER = ""          # 不预设任何域名，必须由使用者自己指定
 TIMEOUT = 5.0
 
@@ -554,13 +554,20 @@ def sample_net(net, k):
             for o in random.sample(range(1, size - 1), k)]
 
 
+# 最近一次 build_targets 因「同 host 不同端口」合并掉的目标数(供 run() 提示)
+LAST_DEDUP = 0
+
+
 def build_targets(items, sample_cidr=False, per_net=1, cap=1200):
     """
     统一解析目标,返回 [(host, port 或 None), ...]
     支持: IP、域名、IP:端口、域名:端口、网段(CIDR)
+    同一域名或 IP 无论端口是否相同,都视为同一个节点(只保留首次出现的端口)
     sample_cidr=True 时每个网段只随机抽 per_net 个 IP,总量不超过 cap
     """
+    global LAST_DEDUP
     out, seen = [], set()
+    dedup_count = 0
     src = list(items)
     if sample_cidr:
         random.shuffle(src)          # 打乱后取,保证各网段覆盖均匀
@@ -596,10 +603,14 @@ def build_targets(items, sample_cidr=False, per_net=1, cap=1200):
             if p.isdigit():
                 s, port = h, int(p)
 
-        key = (s.lower(), port)
+        # 按 host 去重:同一域名/IP 端口不同也视为同一个,保留首次出现的端口
+        key = s.lower()
         if s and key not in seen:
             seen.add(key)
             out.append((s, port))
+        elif s:
+            dedup_count += 1
+    LAST_DEDUP = dedup_count
     return out
 
 
@@ -623,6 +634,8 @@ def run(targets, worker, rounds, ports, threads):
     print()
     print(bold(f"Worker 域名 (SNI/Host): {worker}"))
     print(bold(f"目标 {len(targets)} 个 | 采样 {rounds} 轮 | 端口池 {','.join(map(str, ports))}(每个目标随机1个)"))
+    if LAST_DEDUP:
+        print(gray(f"  已合并 {LAST_DEDUP} 个同域名/IP(端口不同视为同一个)"))
     print()
 
     # 1. 解析(并发 DNS,1280 个域名也能在几十秒内完成)
