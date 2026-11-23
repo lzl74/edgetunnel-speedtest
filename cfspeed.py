@@ -58,10 +58,19 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.3"
+VERSION = "1.4"
 # 不内置任何 Worker 域名,运行时由用户输入或用 -w 指定
 DEFAULT_WORKER = ""
 TIMEOUT = 5.0
+
+# 运行路径与结果输出目录
+APP_DIR = (os.path.dirname(os.path.abspath(sys.executable))
+           if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(APP_DIR, "results")
+try:
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+except Exception:
+    RESULTS_DIR = APP_DIR
 
 try:
     import presets as P
@@ -212,14 +221,20 @@ def resolve(host, limit=None):
     return out
 
 
-DOH_ENDPOINTS = ["https://cloudflare-dns.com/dns-query", "https://1.1.1.1/dns-query"]
+DOH_ENDPOINTS = [
+    "https://223.5.5.5/resolve",            # 阿里公共 DNS (无需 SNI 依赖, 支持 IP 直连, 国内高可用)
+    "https://dns.alidns.com/resolve",       # 阿里公共 DNS 域名入口
+    "https://doh.pub/dns-query",            # 腾讯 DNSPod
+    "https://cloudflare-dns.com/dns-query", # Cloudflare 官方 DoH (境外直连兜底)
+]
 _DOH_CACHE = {}
 
 
-def doh_resolve(host, timeout=6.0):
+def doh_resolve(host, timeout=3.5):
     """
-    DNS over HTTPS 解析,绕过本地 DNS 污染。
-    返回 A 记录列表;全部失败返回 None(与"查到了但为空"区分开)
+    DNS over HTTPS 解析, 绕过本地 DNS 污染。
+    采用多源 DoH 策略(国内高可用源优先, 规避 1.1.1.1 在国内阻断),
+    返回 A 记录列表; 全部失败返回 None(与"查到了但为空"区分开)。
     """
     if host in _DOH_CACHE:
         return _DOH_CACHE[host]
@@ -382,8 +397,14 @@ def http_probe(ip, port, worker, timeout=TIMEOUT):
             pass
 
 
-def speed_test(ip, port, nbytes=5_000_000, timeout=20.0):
-    """经 speed.cloudflare.com 测这个 IP 的真实下行带宽(Mbps)"""
+def speed_test(ip, port, nbytes=25_000_000, timeout=12.0, max_duration=5.0):
+    """
+    经 speed.cloudflare.com 测这个 IP 的真实下行带宽(Mbps)。
+    采用时间窗口与自适应字节测速：
+    - 高速连接充分利用数据量克服 TCP 慢启动
+    - 慢速连接在达到 max_duration (默认 5s) 时自动截断，避免长时间卡死
+    - 排除 TLS 握手时间，只计算纯数据传输阶段的真实速率
+    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -391,7 +412,6 @@ def speed_test(ip, port, nbytes=5_000_000, timeout=20.0):
         ctx = ssl.create_default_context()
         ctx.set_alpn_protocols(["http/1.1"])
         ss = ctx.wrap_socket(s, server_hostname="speed.cloudflare.com")
-        t0 = time.perf_counter()
         ss.sendall(f"GET /__down?bytes={nbytes} HTTP/1.1\r\n"
                    f"Host: speed.cloudflare.com\r\nUser-Agent: cfspeed/{VERSION}\r\n"
                    f"Connection: close\r\n\r\n".encode())
@@ -403,18 +423,24 @@ def speed_test(ip, port, nbytes=5_000_000, timeout=20.0):
             buf += ch
         body = buf.split(b"\r\n\r\n", 1)[-1]
         total = len(body)
-        ss.settimeout(4.0)
+        t0 = time.perf_counter()
+        ss.settimeout(3.0)
         while total < nbytes:
+            if time.perf_counter() - t0 >= max_duration:
+                break
             try:
-                ch = ss.recv(262144)
+                ch = ss.recv(131072)
+                if not ch:
+                    break
+                total += len(ch)
             except Exception:
                 break
-            if not ch:
-                break
-            total += len(ch)
         el = time.perf_counter() - t0
-        ss.close()
-        if total < 200_000:
+        try:
+            ss.close()
+        except Exception:
+            pass
+        if total < 200_000 or el <= 0.05:
             return None
         return round(total * 8 / el / 1_000_000, 2)
     except Exception:
@@ -482,8 +508,8 @@ def build_targets(items):
 def merge_rows(rows):
     """
     同一域名 + 同一端口可能解析出多个 CF IP,各测了一遍。
-    这里合并成一行:取表现最好的那个 IP 作为主结果,其余记入备选。
-    返回 (合并后的行, {目标: [(ip, 中位), ...]})
+    这里合并成一行: 优先取丢包率低且延迟表现最好的 IP 作为主结果, 其余记入备选。
+    返回 (合并后的行, {目标: [(ip, 中位, 丢包率), ...]})
     """
     groups = {}
     for r in rows:
@@ -492,9 +518,10 @@ def merge_rows(rows):
     out, alts = [], {}
     for grp in groups.values():
         grp.sort(key=lambda r: (not r["ok"],
+                                r.get("loss_rate", 1.0),
                                 r["med"] if r["med"] is not None else float("inf")))
         best = dict(grp[0])
-        others = [(r["ip"], r["med"]) for r in grp[1:]]
+        others = [(r["ip"], r["med"], r.get("loss_pct", 0)) for r in grp[1:]]
         best["alt_ips"] = others
         best["ip_count"] = len(grp)
         if others:
@@ -503,22 +530,166 @@ def merge_rows(rows):
     return out, alts
 
 
-# ---------- 主流程 ----------
+# ---------- 客户端配置生成与导出 ----------
 def top_lines(good, n):
     """取前 n 名,生成 ip:port#机房 形式(可直接粘进客户端)"""
     return [f"{r['ip']}:{r['port']}#{r['colo'] or '-'}" for r in good[:n]]
 
 
-def save_top(good, n, out_dir):
-    path = os.path.join(out_dir, f"top{n}_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+def generate_clash_meta(rows, worker, uuid="11111111-1111-1111-1111-111111111111", ws_path="/"):
+    uuid = str(uuid).strip() or "11111111-1111-1111-1111-111111111111"
+    ws_path = str(ws_path).strip() or "/"
+    if not ws_path.startswith("/"):
+        ws_path = "/" + ws_path
+
+    L = [
+        "# ========================================================",
+        "# 由 cfspeed 生成的 Clash.Meta / Mihomo 优选节点配置片段",
+        f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# Worker 域名: {worker}",
+        "# 可直接复制 proxies / proxy-groups 内容到你的 Clash 配置文件中",
+        "# ========================================================",
+        "",
+        "proxies:",
+    ]
+    node_names = []
+    for i, r in enumerate(rows, 1):
+        colo = r.get("colo") or "CF"
+        name = f"CF-{colo}-{i:02d}-{r['ip']}"
+        node_names.append(f'"{name}"')
+        L.append(f'  - name: "{name}"')
+        L.append("    type: vless")
+        L.append(f"    server: {r['ip']}")
+        L.append(f"    port: {r['port']}")
+        L.append(f'    uuid: "{uuid}"')
+        L.append("    udp: true")
+        L.append("    tls: true")
+        L.append(f"    servername: {worker}")
+        L.append("    client-fingerprint: chrome")
+        L.append("    network: ws")
+        L.append("    ws-opts:")
+        L.append(f'      path: "{ws_path}"')
+        L.append("      headers:")
+        L.append(f"        Host: {worker}")
+        L.append("")
+
+    L.append("proxy-groups:")
+    L.append("  - name: CF-AUTO")
+    L.append("    type: url-test")
+    L.append(f"    proxies: [{', '.join(node_names)}]")
+    L.append("    url: https://www.gstatic.com/generate_204")
+    L.append("    interval: 300")
+    L.append("    tolerance: 50")
+    L.append("")
+    return "\n".join(L) + "\n"
+
+
+def generate_sing_box(rows, worker, uuid="11111111-1111-1111-1111-111111111111", ws_path="/"):
+    uuid = str(uuid).strip() or "11111111-1111-1111-1111-111111111111"
+    ws_path = str(ws_path).strip() or "/"
+    if not ws_path.startswith("/"):
+        ws_path = "/" + ws_path
+
+    outbounds = []
+    tags = []
+    for i, r in enumerate(rows, 1):
+        colo = r.get("colo") or "CF"
+        tag = f"CF-{colo}-{i:02d}-{r['ip']}"
+        tags.append(tag)
+        outbounds.append({
+            "type": "vless",
+            "tag": tag,
+            "server": r["ip"],
+            "server_port": r["port"],
+            "uuid": uuid,
+            "tls": {
+                "enabled": True,
+                "server_name": worker,
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": "chrome"
+                }
+            },
+            "transport": {
+                "type": "ws",
+                "path": ws_path,
+                "headers": {
+                    "Host": worker
+                }
+            }
+        })
+
+    outbounds.append({
+        "type": "urltest",
+        "tag": "CF-AUTO",
+        "outbounds": tags,
+        "url": "https://www.gstatic.com/generate_204",
+        "interval": "5m",
+        "tolerance": 50
+    })
+
+    return json.dumps({"outbounds": outbounds}, ensure_ascii=False, indent=2) + "\n"
+
+
+def generate_vless_links(rows, worker, uuid="11111111-1111-1111-1111-111111111111", ws_path="/"):
+    uuid = str(uuid).strip() or "11111111-1111-1111-1111-111111111111"
+    ws_path = str(ws_path).strip() or "/"
+    if not ws_path.startswith("/"):
+        ws_path = "/" + ws_path
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        colo = r.get("colo") or "CF"
+        tag = f"CF-{colo}-{i:02d}-{r['ip']}"
+        q = urllib.parse.urlencode({
+            "encryption": "none",
+            "security": "tls",
+            "sni": worker,
+            "fp": "chrome",
+            "type": "ws",
+            "host": worker,
+            "path": ws_path,
+        })
+        link = f"vless://{uuid}@{r['ip']}:{r['port']}?{q}#{urllib.parse.quote(tag)}"
+        lines.append(link)
+    return "\n".join(lines) + "\n"
+
+
+def save_top(good, n, out_dir, worker="", uuid="", ws_path="/", export_all=True):
+    ts = time.strftime('%Y%m%d_%H%M%S')
+    files_saved = []
+
+    # 1. 经典文本
+    path_txt = os.path.join(out_dir, f"top{n}_{ts}.txt")
     lines = top_lines(good, n)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path_txt, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    return path, lines
+    files_saved.append(("纯文本列表", path_txt))
+
+    if export_all and worker:
+        # 2. Clash.Meta / Mihomo
+        path_clash = os.path.join(out_dir, f"clash_meta_top{n}_{ts}.yaml")
+        with open(path_clash, "w", encoding="utf-8") as f:
+            f.write(generate_clash_meta(good[:n], worker, uuid, ws_path))
+        files_saved.append(("Clash.Meta配置", path_clash))
+
+        # 3. Sing-box
+        path_sb = os.path.join(out_dir, f"sing_box_top{n}_{ts}.json")
+        with open(path_sb, "w", encoding="utf-8") as f:
+            f.write(generate_sing_box(good[:n], worker, uuid, ws_path))
+        files_saved.append(("Sing-box配置", path_sb))
+
+        # 4. VLESS 直链
+        path_vless = os.path.join(out_dir, f"vless_links_top{n}_{ts}.txt")
+        with open(path_vless, "w", encoding="utf-8") as f:
+            f.write(generate_vless_links(good[:n], worker, uuid, ws_path))
+        files_saved.append(("VLESS直链列表", path_vless))
+
+    return files_saved, lines
 
 
 def run(targets, worker, rounds, do_speed, ports, threads,
-        all_ips=False, use_doh=True, max_ips=2):
+        all_ips=False, use_doh=True, max_ips=2, export_n=0, uuid="", ws_path="/"):
     """
     do_speed:
         True  直接测带宽
@@ -627,29 +798,51 @@ def run(targets, worker, rounds, do_speed, ports, threads,
     clear_progress()
 
     rows = []
-    need = min(rounds, max(2, rounds // 3))
     for key, vals in samples.items():
         t, ip, p = key
         m = meta.get(key, {})
-        if len(vals) < need:
+        ok_n = len(vals)
+        loss_rate = (rounds - ok_n) / rounds
+        loss_pct = round(loss_rate * 100)
+
+        # 丢包率判定规则:
+        # 全部超时/失败
+        if ok_n == 0:
             rows.append({"target": t, "ip": ip, "port": p, "ok": False,
                          "colo": m.get("colo"), "med": None, "min": None,
-                         "sd": None, "mbps": None, "n": len(vals),
-                         "note": m.get("note") or "可用次数太少"})
+                         "sd": None, "mbps": None, "n": 0, "rounds": rounds,
+                         "loss_rate": 1.0, "loss_pct": 100,
+                         "note": m.get("note") or "全部请求超时/失败"})
             continue
+
+        # 丢包率超过 50%: 视为不可用节点, 代理环境极其卡顿
+        if loss_rate > 0.5:
+            rows.append({"target": t, "ip": ip, "port": p, "ok": False,
+                         "colo": m.get("colo"), "med": statistics.median(vals),
+                         "min": min(vals),
+                         "sd": statistics.pstdev(vals) if ok_n > 1 else 0.0,
+                         "mbps": None, "n": ok_n, "rounds": rounds,
+                         "loss_rate": loss_rate, "loss_pct": loss_pct,
+                         "note": f"丢包率过高 ({loss_pct}%)"})
+            continue
+
+        # 正常可用节点
         rows.append({"target": t, "ip": ip, "port": p, "ok": True,
                      "colo": m.get("colo"), "med": statistics.median(vals),
                      "min": min(vals),
-                     "sd": statistics.pstdev(vals) if len(vals) > 1 else 0.0,
-                     "mbps": None, "n": len(vals), "note": ""})
+                     "sd": statistics.pstdev(vals) if ok_n > 1 else 0.0,
+                     "mbps": None, "n": ok_n, "rounds": rounds,
+                     "loss_rate": loss_rate, "loss_pct": loss_pct,
+                     "note": ""})
 
-    # 同一域名(同端口)可能解析出多个 CF IP:合并成一行,取最快 IP
+    # 同一域名(同端口)可能解析出多个 CF IP:合并成一行,取丢包少且延迟低的 IP
     merged_alt = {}
     if not all_ips:
         rows, merged_alt = merge_rows(rows)
 
     good = [r for r in rows if r["ok"]]
-    good.sort(key=lambda r: r["med"])
+    # 优先按丢包率升序, 其次按中位数延迟升序
+    good.sort(key=lambda r: (r.get("loss_rate", 1.0), r["med"]))
 
     # 连通性与首字节都测完了,这时候才问要不要测带宽
     speed_top = 10
@@ -658,7 +851,7 @@ def run(targets, worker, rounds, do_speed, ports, threads,
             topn = min(10, len(good))
             print()
             print(gray(f"连通性测完:可用 {len(good)} 个,"
-                       f"最多可以测前 {topn} 名的下载带宽(串行,每个约 5~20 秒)"))
+                       f"最多可以测前 {topn} 名的下载带宽(串行,每个约 3~6 秒)"))
             try:
                 ans = input("是否测下载带宽?[y/N]: ").strip().lower()
             except EOFError:
@@ -689,24 +882,27 @@ def run(targets, worker, rounds, do_speed, ports, threads,
 
     # ---------- 输出 ----------
     print()
-    print("=" * 78)
-    print(bold(" 结果(按首字节延迟排序)"))
-    print("=" * 78)
-    hdr = (pad("#", 3, ">") + " " + pad("目标", 24) + pad("IP", 17) +
-           pad("机房", 6, ">") + pad("端口", 6, ">") + pad("中位", 8, ">") +
-           pad("最快", 8, ">") + pad("抖动", 7, ">") + pad("带宽", 9, ">"))
+    print("=" * 82)
+    print(bold(" 结果(按丢包率与首字节延迟排序)"))
+    print("=" * 82)
+    hdr = (pad("#", 3, ">") + " " + pad("目标", 22) + pad("IP", 16) +
+           pad("机房", 5, ">") + pad("端口", 6, ">") + pad("丢包", 6, ">") +
+           pad("中位", 7, ">") + pad("最快", 7, ">") + pad("抖动", 6, ">") +
+           pad("带宽", 9, ">"))
     print(hdr)
-    print("-" * 78)
+    print("-" * 82)
     show = good[:40]
     for i, r in enumerate(show, 1):
         mb = f'{r["mbps"]:.1f}' if r["mbps"] else "-"
-        line = (pad(i, 3, ">") + " " + pad(r["target"][:23], 24) + pad(r["ip"], 17) +
-                pad(r["colo"] or "-", 6, ">") + pad(r["port"], 6, ">") +
-                pad(f'{r["med"]:.0f}', 8, ">") + pad(f'{r["min"]:.0f}', 8, ">") +
-                pad(f'{r["sd"]:.0f}', 7, ">") + pad(mb, 9, ">"))
-        if r["med"] < 300:
+        loss_str = f"{r.get('loss_pct', 0)}%"
+        line = (pad(i, 3, ">") + " " + pad(r["target"][:21], 22) + pad(r["ip"], 16) +
+                pad(r["colo"] or "-", 5, ">") + pad(r["port"], 6, ">") +
+                pad(loss_str, 6, ">") +
+                pad(f'{r["med"]:.0f}', 7, ">") + pad(f'{r["min"]:.0f}', 7, ">") +
+                pad(f'{r["sd"]:.0f}', 6, ">") + pad(mb, 9, ">"))
+        if r["loss_pct"] == 0 and r["med"] < 300:
             print(green(line))
-        elif r["med"] < 600:
+        elif r["loss_pct"] <= 20 and r["med"] < 600:
             print(line)
         else:
             print(yellow(line))
@@ -717,12 +913,13 @@ def run(targets, worker, rounds, do_speed, ports, threads,
         shown = [r for r in good if r["target"] in merged_alt][:6]
         if shown:
             print()
-            print(gray(f"同名多 IP 已合并 {len(merged_alt)} 个(每行取最快 IP,其余为备选):"))
+            print(gray(f"同名多 IP 已合并 {len(merged_alt)} 个(每行取丢包最少/最快 IP,其余为备选):"))
             for r in shown:
                 alt = "  ".join(
-                    f"{ip}({f'{med:.0f}ms' if med is not None else '不可用'})"
-                    for ip, med in r["alt_ips"][:3])
-                print(gray(f"   {pad(r['target'][:23], 24)}{r['ip']}  ← 另 {alt}"))
+                    f"{ip}({f'{med:.0f}ms' if med is not None else '不可用'}"
+                    + (f",{loss}%丢包" if loss > 0 else "") + ")"
+                    for ip, med, loss in r["alt_ips"][:3])
+                print(gray(f"   {pad(r['target'][:21], 22)}{r['ip']}  ← 另 {alt}"))
             if len(merged_alt) > len(shown):
                 print(gray(f"   ... 另有 {len(merged_alt)-len(shown)} 个,见 CSV 的备选 IP 列"))
 
@@ -731,7 +928,8 @@ def run(targets, worker, rounds, do_speed, ports, threads,
         print()
         print(gray(f"不可用 {len(bad)} 个:"))
         for r in bad[:8]:
-            print(gray(f"   {r['target']} ({r['ip']}:{r['port']})  —  {r['note']}"))
+            loss_note = f"丢包 {r.get('loss_pct', 100)}%, " if r.get("loss_pct", 0) > 0 else ""
+            print(gray(f"   {r['target']} ({r['ip']}:{r['port']})  —  {loss_note}{r['note']}"))
 
     if good:
         colos = {}
@@ -742,28 +940,30 @@ def run(targets, worker, rounds, do_speed, ports, threads,
                                     sorted(colos.items(), key=lambda x: -x[1])))
         best = good[0]
         print(bold(f"最优: {best['ip']}:{best['port']}  ({best['colo']})  "
-                   f"中位 {best['med']:.0f}ms"))
+                   f"丢包 {best.get('loss_pct', 0)}%  中位 {best['med']:.0f}ms"))
         if len(good) >= 3:
             print(gray("提示:前几名差距常在噪声范围内,建议挑 2~3 个轮换使用。"))
 
-    # ---------- 存盘 ----------
-    out = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
-                       f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    # ---------- 存盘 (自动保存至 results/ 目录) ----------
+    out = os.path.join(RESULTS_DIR, f"cfspeed_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     try:
         with open(out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["目标", "IP", "端口", "机房", "中位延迟ms", "最快ms",
-                        "抖动ms", "带宽Mbps", "有效样本", "可用", "备注",
+            w.writerow(["目标", "IP", "端口", "机房", "丢包率", "中位延迟ms", "最快ms",
+                        "抖动ms", "带宽Mbps", "有效样本", "总轮数", "可用", "备注",
                         "IP数", "备选IP"])
             for r in good + bad:
                 alts = " ".join(
                     f"{ip}({f'{med:.0f}ms' if med is not None else '不可用'})"
-                    for ip, med in r.get("alt_ips", []))
+                    for item in r.get("alt_ips", [])
+                    for ip, med in [(item[0], item[1])])
                 w.writerow([r["target"], r["ip"], r["port"], r["colo"] or "",
-                            f'{r["med"]:.0f}' if r["med"] else "",
-                            f'{r["min"]:.0f}' if r["min"] else "",
-                            f'{r["sd"]:.0f}' if r["sd"] else "",
-                            r["mbps"] or "", r["n"], "是" if r["ok"] else "否", r["note"],
+                            f"{r.get('loss_pct', 0)}%",
+                            f'{r["med"]:.0f}' if r["med"] is not None else "",
+                            f'{r["min"]:.0f}' if r["min"] is not None else "",
+                            f'{r["sd"]:.0f}' if r["sd"] is not None else "",
+                            r["mbps"] or "", r.get("n", 0), r.get("rounds", rounds),
+                            "是" if r["ok"] else "否", r["note"],
                             r.get("ip_count", 1), alts])
         print(gray(f"\n结果已保存: {out}"))
     except Exception as e:
@@ -771,9 +971,20 @@ def run(targets, worker, rounds, do_speed, ports, threads,
 
     print(gray(f"总耗时 {time.time()-t_start:.0f}s"))
 
+    # 命令行自动导出配置
+    if not interactive_mode and export_n > 0 and good:
+        n = min(export_n, len(good))
+        try:
+            saved, lines = save_top(good, n, RESULTS_DIR, worker=worker, uuid=uuid, ws_path=ws_path, export_all=True)
+            print(bold(f"\n已自动导出前 {n} 名客户端配置:"))
+            for desc, fpath in saved:
+                print(green(f"  √ {pad(desc, 14)}: {fpath}"))
+        except Exception as e:
+            print(red(f"\n自动导出配置失败: {e}"))
+
     # ---------- 交互模式收尾:导出前几名 ----------
     if interactive_mode:
-        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+        base = RESULTS_DIR
         while good:
             print()
             print(bold(f"可用 {len(good)} 个。要导出前几名?(直接回车结束)"))
@@ -788,8 +999,20 @@ def run(targets, worker, rounds, do_speed, ports, threads,
                 print(red("请输入正整数,例如 5"))
                 continue
             n = min(int(sel), len(good))
+
+            print(gray("导出选项: [1] 经典纯文本(ip:port#机房)  [2] 全套客户端配置(Clash.Meta + Sing-box + VLESS直链 + 文本)"))
+            fmt = input("选择 [2]: ").strip() or "2"
+            export_all = (fmt == "2")
+
+            in_uuid = ""
+            in_path = "/"
+            if export_all:
+                print(gray("提示: 可输入你的 Worker UUID (留空使用占位符 11111111-1111-1111-1111-111111111111):"))
+                in_uuid = input("UUID: ").strip()
+                in_path = input("WS Path [/]: ").strip() or "/"
+
             try:
-                path, lines = save_top(good, n, base)
+                saved, lines = save_top(good, n, base, worker=worker, uuid=in_uuid, ws_path=in_path, export_all=export_all)
             except Exception as e:
                 print(red(f"导出失败: {e}"))
                 continue
@@ -797,7 +1020,9 @@ def run(targets, worker, rounds, do_speed, ports, threads,
             print(bold(f"前 {n} 名(ip:端口#机房):"))
             for i, ln in enumerate(lines, 1):
                 print("  " + pad(i, 2, ">") + "  " + ln)
-            print(gray(f"已保存: {path}"))
+            print()
+            for desc, fpath in saved:
+                print(green(f"  √ {pad(desc, 14)}: {fpath}"))
         print()
         try:
             input(gray("按回车退出 ..."))
@@ -973,6 +1198,10 @@ def main():
                     help="关闭 DoH 兜底解析(默认开启,可绕过本地 DNS 污染)")
     ap.add_argument("--max-ips", type=int, default=2,
                     help="每个目标最多测几个 IP,默认 2")
+    ap.add_argument("--uuid", default="", help="Worker/VLESS 节点的 UUID (用于导出客户端配置)")
+    ap.add_argument("--ws-path", default="/", help="WebSocket 路径, 默认 /")
+    ap.add_argument("-e", "--export", type=int, default=0,
+                    help="自动导出前 N 名的客户端配置文件到 results/ 目录")
     ap.add_argument("-v", "--version", action="version", version=f"cfspeed {VERSION}")
     args = ap.parse_args()
 
@@ -1018,7 +1247,8 @@ def main():
         ports = [int(x) for x in args.ports.replace(",", " ").split() if x.isdigit()] or [443]
         return run(targets, args.worker, max(1, args.rounds), args.speed, ports, args.threads,
                    all_ips=args.all_ips, use_doh=not args.no_doh,
-                   max_ips=max(1, args.max_ips))
+                   max_ips=max(1, args.max_ips),
+                   export_n=args.export, uuid=args.uuid, ws_path=args.ws_path)
     except KeyboardInterrupt:
         print(yellow("\n已取消。"))
         return 130

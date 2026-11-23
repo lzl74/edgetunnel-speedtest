@@ -38,9 +38,15 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# PyInstaller 打包后 __file__ 在临时解包目录, 数据文件要跟着 exe 走
-_BASE = (os.path.dirname(os.path.abspath(sys.executable))
-         if getattr(sys, "frozen", False) else HERE)
+# PyInstaller 打包后优先检查内嵌临时目录 _MEIPASS，再检查可执行文件同级目录
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", "")
+    if _meipass and os.path.exists(os.path.join(_meipass, "cf_ranges.json")):
+        _BASE = _meipass
+    else:
+        _BASE = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _BASE = HERE
 CACHE = os.path.join(_BASE, "cf_ranges.json")
 
 # 兜底: 官网公开清单。cf_ranges.json 缺失时至少还能工作

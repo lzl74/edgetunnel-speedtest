@@ -13,9 +13,11 @@ make_variants.py : 把 edgetunnel 订阅里的同一个节点,按 nodes.txt 里�
     variants_sub.txt    base64 订阅文件 -> v2rayN / NekoBox / Shadowrocket 导入
     variants_plain.txt  明文节点列表    -> 手动导入 / 转二维码
     clash.yaml          Clash / mihomo 配置,自带 url-test 分组
+    sing-box.json       Sing-box 配置片段,自带 urltest 出站
 """
 import argparse
 import base64
+import json
 import os
 import re
 import sys
@@ -139,6 +141,46 @@ def clash_yaml(nodes, tpl):
     return "\n".join(L) + "\n"
 
 
+def singbox_json(nodes, tpl):
+    q = tpl["params"]
+    path = q.get("path", "/")
+    outbounds = []
+    tags = []
+    for name, host, port in nodes:
+        tags.append(name)
+        outbounds.append({
+            "type": "vless",
+            "tag": name,
+            "server": host,
+            "server_port": port,
+            "uuid": tpl["uuid"],
+            "tls": {
+                "enabled": True,
+                "server_name": tpl["host"],
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": q.get("fp", "chrome")
+                }
+            },
+            "transport": {
+                "type": "ws",
+                "path": path,
+                "headers": {
+                    "Host": q.get("host", tpl["host"])
+                }
+            }
+        })
+    outbounds.append({
+        "type": "urltest",
+        "tag": "AUTO",
+        "outbounds": tags,
+        "url": "https://www.gstatic.com/generate_204",
+        "interval": "5m",
+        "tolerance": 50
+    })
+    return json.dumps({"outbounds": outbounds}, ensure_ascii=False, indent=2) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sub", required=True, help="订阅链接或本地订阅文件")
@@ -175,11 +217,14 @@ def main():
         f.write(b64)
     with open(os.path.join(HERE, "clash.yaml"), "w", encoding="utf-8") as f:
         f.write(clash_yaml(nodes, tpl))
+    with open(os.path.join(HERE, "sing-box.json"), "w", encoding="utf-8") as f:
+        f.write(singbox_json(nodes, tpl))
 
     print(f"\n已生成:")
     print(f"  {os.path.join(HERE, 'variants_sub.txt')}    <- 客户端导入这个(base64 订阅)")
     print(f"  {os.path.join(HERE, 'variants_plain.txt')}  <- 明文节点列表")
     print(f"  {os.path.join(HERE, 'clash.yaml')}          <- Clash / mihomo 配置")
+    print(f"  {os.path.join(HERE, 'sing-box.json')}       <- Sing-box 配置")
 
 
 if __name__ == "__main__":
