@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Test results and run outputs
+results/*
+!results/.gitkeep
+archive/
+
+# OS and Editor
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.log

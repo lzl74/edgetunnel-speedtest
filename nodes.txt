@@ -1,0 +1,19 @@
+cdn.7zz.cn:2096#JP 电信优选[cdn.7zz.cn 85ms]
+cf.lzl.im#HK 链式SOCKS5代理$socks5://88888:88888@8.210.36.244:1080
+cf.lzl.im#HK 链式HTTP代理$http://45.125.64.215:443
+cf.lzl.im#HK 链式HTTPS代理$https://146.70.9.242:9443
+cf.lzl.im#JP 链式SSTP代理$sstp://vpn:vpn@laud.opengw.net:443
+172.64.150.120:2053#SG 联通优选[85ms]
+172.64.154.157:2053#SG 联通优选[92ms]
+www.udacity.com:2096#SG 电信优选[www.udacity.com 60ms]
+www.sage.com:2083#SG 电信优选[www.sage.com 60ms]
+jobsdb.com:2096#SG 电信优选[jobsdb.com 66ms]
+190.93.247.233:2053#HK 官方优选[128ms]
+172.64.190.185:8443#HK 官方优选[134ms]
+172.67.163.210:2083#CN 优选反代[134ms]
+172.66.216.15:8443#CN 优选反代[138ms]
+188.114.98.255:8443#HK 官方优选[147ms]
+cf.lzl.im#HK 链式SOCKS5代理$socks5://45.194.33.12:30002
+cf.lzl.im#HK 链式HTTP代理$http://45.125.64.215:443
+cf.lzl.im#HK 链式HTTPS代理$https://119.28.65.31:3128
+cf.lzl.im#US 链式SSTP代理$sstp://vpn:vpn@vpn587594110.opengw.net:1716
